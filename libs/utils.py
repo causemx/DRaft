@@ -64,18 +64,6 @@ class FlightMode(enum.Enum):
         """Return JSON serializable representation"""
         return self.value
 
-class CommandQueue():
-    def __init__(self):
-        self.queue = queue.Queue()
-
-    def put(self, command:str) -> None:
-        self.queue.put(command)
-        logger.info(f"put command: {command} success")
-        
-    def get(self) -> str:
-        command = self.queue.get()
-        self.queue.task_done()
-        return command
 
 class DroneController:
     def __init__(self, connection_string):
@@ -814,11 +802,3 @@ class DroneController:
         if self.drone:
             self.drone.close()
             logger.info("Drone connection closed")
-
-# for test
-if __name__ == "__main__":
-    q = CommandQueue()
-    q.put("connect")
-    q.put('arm')
-    print(q.get())
-    print(q.get())
