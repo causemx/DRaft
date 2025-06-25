@@ -2,7 +2,6 @@ import sys
 import time
 import threading
 import enum
-import queue
 from pymavlink import mavutil
 import pymavlink.dialects.v20.all as dialect
 from datetime import datetime
@@ -375,39 +374,27 @@ class DroneController:
             param7=target_altitude
         )
 
-        # Try takeoff with retries using while loop
-        attempts = 0
-        while attempts < max_retries:
-            attempts += 1
 
-            # Send the takeoff message
-            self.drone.mav.send(takeoff_message)
-            logger.info(f"Takeoff attempt {attempts}/{max_retries} to {target_altitude}m")
+        # Send the takeoff message
+        self.drone.mav.send(takeoff_message)
+        logger.info(f"Takeoff attempt to {target_altitude}m")
 
-            # Wait for acknowledgment
-            ack = self.drone.recv_match(type='COMMAND_ACK', blocking=True, timeout=1.0)
+        # Wait for acknowledgment
+        ack = self.drone.recv_match(type='COMMAND_ACK', blocking=True, timeout=1.0)
 
-            if ack and ack.command == dialect.MAV_CMD_NAV_TAKEOFF:
-                success = (ack.result == dialect.MAV_RESULT_ACCEPTED)
-                if success:
-                    logger.success(f"Takeoff command accepted! Target altitude: {target_altitude}m")
-                    self.altitude = target_altitude
-                    return True
-                else:
-                    # Log the specific failure reason if available
-                    result_name = dialect.enums['MAV_RESULT'][ack.result].name if ack.result in dialect.enums['MAV_RESULT'] else f"Unknown ({ack.result})"
-                    logger.warning(f"Takeoff attempt {attempts} failed: {result_name}")
+        if ack and ack.command == dialect.MAV_CMD_NAV_TAKEOFF:
+            success = (ack.result == dialect.MAV_RESULT_ACCEPTED)
+            if success:
+                logger.success(f"Takeoff command accepted! Target altitude: {target_altitude}m")
+                self.altitude = target_altitude
+                return True
             else:
-                logger.warning(f"No acknowledgment received for takeoff attempt {attempts}")
+                # Log the specific failure reason if available
+                result_name = dialect.enums['MAV_RESULT'][ack.result].name if ack.result in dialect.enums['MAV_RESULT'] else f"Unknown ({ack.result})"
+                logger.warning(f"Takeoff attempt failed: {result_name}")
+        else:
+            logger.warning("No acknowledgment received for takeoff attempt")
 
-            # Check if we should retry
-            if attempts < max_retries:
-                logger.info(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-            else:
-                logger.error(f"Takeoff failed after {max_retries} attempts")
-
-        return False
 
     def fly_to_here(self, distance=5.0, angle=0.0, max_retries=3):
         """

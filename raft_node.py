@@ -1,15 +1,32 @@
+#!/usr/bin/env python3
+"""
+Integrated Raft-Drone Node - Combines Raft consensus with drone control
+Each Raft node controls a specific drone, enabling distributed consensus for swarm operations
+"""
+
 import asyncio
 import json
 import random
 import time
 import logging
 import struct
+import threading
 from enum import Enum
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple, Any
+from libs.utils import DroneController, FlightMode
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Drone connection strings for SITL instances
+DRONE_CONNECTIONS = [
+    "udp:172.21.128.1:14550",  # Drone 0
+    "udp:172.21.128.1:14560",  # Drone 1
+    "udp:172.21.128.1:14570",  # Drone 2
+    "udp:172.21.128.1:14580",  # Drone 3
+    "udp:172.21.128.1:14590"   # Drone 4
+]
 
 class NodeState(Enum):
     FOLLOWER = "follower"
@@ -25,12 +42,30 @@ class MessageType(Enum):
     CLIENT_RESPONSE = "client_response"
     STATUS_REQUEST = "status_request"
     STATUS_RESPONSE = "status_response"
+    SWARM_COMMAND = "swarm_command"
+    SWARM_RESPONSE = "swarm_response"
+
+class SwarmCommandType(Enum):
+    CONNECT_ALL = "connect_all"
+    ARM_ALL = "arm_all"
+    DISARM_ALL = "disarm_all"
+    TAKEOFF_ALL = "takeoff_all"
+    LAND_ALL = "land_all"
+    SET_FORMATION = "set_formation"
+    EXECUTE_FORMATION = "execute_formation"
+    GET_SWARM_STATUS = "get_swarm_status"
+    INDIVIDUAL_COMMAND = "individual_command"
 
 @dataclass
 class LogEntry:
     term: int
     index: int
     command: str
+    timestamp: float = None
+
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = time.time()
 
 @dataclass
 class Message:
@@ -63,6 +98,13 @@ class AppendEntriesRequest:
 class AppendEntriesResponse:
     term: int
     success: bool
+    match_index: int = -1
+
+@dataclass
+class SwarmCommand:
+    command_type: str
+    parameters: Dict[str, Any]
+    target_nodes: List[str] = None  # None means all nodes
 
 class SocketProtocol:
     """Simple protocol for sending/receiving messages over TCP"""
@@ -109,11 +151,16 @@ class SocketProtocol:
             logging.debug(f"Error receiving message: {e}")
             return None
 
-class RaftNode:
-    def __init__(self, node_id: str, port: int, peers: List[Tuple[str, int]]):
+class RaftDroneNode:
+    def __init__(self, node_id: str, port: int, drone_index: int, peers: List[Tuple[str, int]]):
         self.node_id = node_id
         self.port = port
+        self.drone_index = drone_index
         self.peers = peers  # List of (node_id, port) tuples
+        
+        # Drone controller
+        self.drone_controller = DroneController(DRONE_CONNECTIONS[drone_index])
+        self.drone_connected = False
         
         # Persistent state
         self.current_term = 0
@@ -136,21 +183,31 @@ class RaftNode:
         
         # Network
         self.server: Optional[asyncio.Server] = None
-        self.client_connections: Dict[str, Tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
         
         # Tasks
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.election_task: Optional[asyncio.Task] = None
+        self.drone_monitor_task: Optional[asyncio.Task] = None
         
-        self.logger = logging.getLogger(f"RaftNode-{self.node_id}")
+        # Swarm coordination
+        self.swarm_state = {
+            'formation_type': None,
+            'formation_position': None,
+            'target_position': None
+        }
+        
+        self.logger = logging.getLogger(f"RaftDrone-{self.node_id}")
         
     def _random_election_timeout(self) -> float:
         """Random election timeout between 1.5-3 seconds"""
         return random.uniform(1.5, 3.0)
     
     async def start(self):
-        """Start the Raft node"""
-        self.logger.info(f"Starting Raft node {self.node_id} on port {self.port}")
+        """Start the Raft node and drone connection"""
+        self.logger.info(f"Starting Raft-Drone node {self.node_id} on port {self.port}")
+        
+        # Connect to drone
+        await self.connect_drone()
         
         # Start TCP server
         self.server = await asyncio.start_server(
@@ -162,7 +219,99 @@ class RaftNode:
         # Start election timer
         self.election_task = asyncio.create_task(self.election_timer())
         
+        # Start drone monitoring
+        self.drone_monitor_task = asyncio.create_task(self.drone_monitor_loop())
+        
         self.logger.info(f"Node {self.node_id} is listening on port {self.port}")
+    
+    async def connect_drone(self):
+        """Connect to the drone"""
+        try:
+            # Run drone connection in a thread to avoid blocking
+            loop = asyncio.get_event_loop()
+            connected = await loop.run_in_executor(
+                None, self.drone_controller.connect
+            )
+            if connected:
+                self.drone_connected = True
+                self.logger.success(f"Connected to drone {self.drone_index}")
+            else:
+                self.logger.error(f"Failed to connect to drone {self.drone_index}")
+        except Exception as e:
+            self.logger.error(f"Error connecting to drone: {e}")
+    
+    async def drone_monitor_loop(self):
+        """Monitor drone status and apply committed commands"""
+        while True:
+            try:
+                # Apply any committed but not applied log entries
+                while self.last_applied < self.commit_index:
+                    self.last_applied += 1
+                    if self.last_applied <= len(self.log):
+                        entry = self.log[self.last_applied - 1]
+                        await self.apply_command(entry.command)
+                
+                await asyncio.sleep(0.1)  # Check every 100ms
+            except Exception as e:
+                self.logger.error(f"Error in drone monitor loop: {e}")
+                await asyncio.sleep(1)
+    
+    async def apply_command(self, command: str):
+        """Apply a committed command to the drone"""
+        try:
+            if not self.drone_connected:
+                self.logger.warning(f"Cannot apply command '{command}' - drone not connected")
+                return
+            
+            # Parse command
+            parts = command.split(':', 1)
+            if len(parts) != 2:
+                self.logger.warning(f"Invalid command format: {command}")
+                return
+            
+            cmd_type, cmd_data = parts
+            data = json.loads(cmd_data) if cmd_data else {}
+            
+            loop = asyncio.get_event_loop()
+            
+            if cmd_type in ["ARM", "ARM_ALL"]:
+                result = await loop.run_in_executor(None, self.drone_controller.arm)
+                self.logger.info(f"Applied ARM command to drone {self.drone_index}: {'SUCCESS' if result else 'FAILED'}")
+            
+            elif cmd_type in ["DISARM", "DISARM_ALL"]:
+                result = await loop.run_in_executor(None, self.drone_controller.disarm)
+                self.logger.info(f"Applied DISARM command to drone {self.drone_index}: {'SUCCESS' if result else 'FAILED'}")
+            
+            elif cmd_type in ["TAKEOFF", "TAKEOFF_ALL"]:
+                altitude = data.get('altitude', 10.0)
+                result = await loop.run_in_executor(None, self.drone_controller.takeoff, altitude)
+                self.logger.info(f"Applied TAKEOFF command to drone {self.drone_index} at {altitude}m: {'SUCCESS' if result else 'FAILED'}")
+            
+            elif cmd_type in ["LAND", "LAND_ALL"]:
+                result = await loop.run_in_executor(None, self.drone_controller.land)
+                self.logger.info(f"Applied LAND command to drone {self.drone_index}: {'SUCCESS' if result else 'FAILED'}")
+            
+            elif cmd_type == "SET_MODE":
+                mode = data.get('mode', 'GUIDED')
+                result = await loop.run_in_executor(None, self.drone_controller.set_flight_mode, mode)
+                self.logger.info(f"Applied SET_MODE command to drone {self.drone_index}: {mode} - {'SUCCESS' if result else 'FAILED'}")
+            
+            elif cmd_type == "FLY_TO":
+                distance = data.get('distance', 0)
+                angle = data.get('angle', 0)
+                result = await loop.run_in_executor(None, self.drone_controller.fly_to_here, distance, angle)
+                self.logger.info(f"Applied FLY_TO command to drone {self.drone_index}: {distance}m at {angle}° - {'SUCCESS' if result else 'FAILED'}")
+            
+            elif cmd_type == "SET_FORMATION":
+                self.swarm_state['formation_type'] = data.get('formation_type')
+                self.swarm_state['formation_position'] = data.get('position')
+                self.logger.info(f"Set formation position for drone {self.drone_index}")
+            
+            else:
+                self.logger.warning(f"Unknown command type: {cmd_type}")
+        
+        except Exception as e:
+            self.logger.error(f"Error applying command '{command}': {e}")
     
     async def handle_client_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle incoming client connections"""
@@ -197,10 +346,23 @@ class RaftNode:
             elif message.msg_type == MessageType.APPEND_ENTRIES.value:
                 # Convert serialized entries back to LogEntry objects
                 entries_data = message.data.get('entries', [])
-                entries = [LogEntry(**entry) for entry in entries_data]
-                message.data['entries'] = entries
+                entries = []
+                for entry_data in entries_data:
+                    if isinstance(entry_data, dict):
+                        entries.append(LogEntry(**entry_data))
+                    else:
+                        # Already a LogEntry object, convert to dict first
+                        if hasattr(entry_data, '__dict__'):
+                            entries.append(LogEntry(**asdict(entry_data)))
+                        else:
+                            self.logger.error(f"Invalid entry data: {entry_data}")
+                            continue
                 
-                append_request = AppendEntriesRequest(**message.data)
+                # Create a copy of message data with converted entries
+                append_data = message.data.copy()
+                append_data['entries'] = entries
+                
+                append_request = AppendEntriesRequest(**append_data)
                 response = await self.handle_append_entries(append_request)
                 response_msg = Message(
                     msg_type=MessageType.APPEND_RESPONSE.value,
@@ -218,6 +380,15 @@ class RaftNode:
                 )
                 await SocketProtocol.send_message(writer, response_msg)
             
+            elif message.msg_type == MessageType.SWARM_COMMAND.value:
+                response = await self.handle_swarm_command(message.data)
+                response_msg = Message(
+                    msg_type=MessageType.SWARM_RESPONSE.value,
+                    data=response,
+                    sender_id=self.node_id
+                )
+                await SocketProtocol.send_message(writer, response_msg)
+            
             elif message.msg_type == MessageType.STATUS_REQUEST.value:
                 response = await self.handle_status_request()
                 response_msg = Message(
@@ -230,25 +401,271 @@ class RaftNode:
         except Exception as e:
             self.logger.error(f"Error processing message: {e}")
     
+    async def handle_swarm_command(self, command_data: Dict) -> Dict:
+        """Handle swarm coordination commands"""
+        if self.state != NodeState.LEADER:
+            return {'error': 'Not leader', 'leader_id': None}
+        
+        try:
+            swarm_cmd = SwarmCommand(**command_data)
+            
+            if swarm_cmd.command_type == SwarmCommandType.CONNECT_ALL.value:
+                return await self.execute_connect_all()
+            
+            elif swarm_cmd.command_type == SwarmCommandType.ARM_ALL.value:
+                return await self.execute_arm_all()
+            
+            elif swarm_cmd.command_type == SwarmCommandType.DISARM_ALL.value:
+                return await self.execute_disarm_all()
+            
+            elif swarm_cmd.command_type == SwarmCommandType.TAKEOFF_ALL.value:
+                altitude = swarm_cmd.parameters.get('altitude', 10.0)
+                return await self.execute_takeoff_all(altitude)
+            
+            elif swarm_cmd.command_type == SwarmCommandType.LAND_ALL.value:
+                return await self.execute_land_all()
+            
+            elif swarm_cmd.command_type == SwarmCommandType.SET_FORMATION.value:
+                return await self.execute_set_formation(swarm_cmd.parameters)
+            
+            elif swarm_cmd.command_type == SwarmCommandType.GET_SWARM_STATUS.value:
+                return await self.get_swarm_status()
+            
+            elif swarm_cmd.command_type == SwarmCommandType.INDIVIDUAL_COMMAND.value:
+                target_node = swarm_cmd.parameters.get('target_node')
+                command = swarm_cmd.parameters.get('command')
+                return await self.execute_individual_command(target_node, command)
+            
+            else:
+                return {'error': f'Unknown swarm command: {swarm_cmd.command_type}'}
+        
+        except Exception as e:
+            self.logger.error(f"Error handling swarm command: {e}")
+            return {'error': str(e)}
+    
+    async def execute_connect_all(self) -> Dict:
+        """Execute connect command on all nodes"""
+        # This is handled locally, no need for consensus
+        if not self.drone_connected:
+            await self.connect_drone()
+        
+        return {'success': True, 'message': 'Connect command processed'}
+    
+    async def execute_arm_all(self) -> Dict:
+        """Execute ARM command on all drones through consensus"""
+        command = "ARM_ALL:{}"
+        success = await self.replicate_command(command)
+        return {'success': success, 'command': 'ARM_ALL'}
+    
+    async def execute_disarm_all(self) -> Dict:
+        """Execute DISARM command on all drones through consensus"""
+        command = "DISARM_ALL:{}"
+        success = await self.replicate_command(command)
+        return {'success': success, 'command': 'DISARM_ALL'}
+    
+    async def execute_takeoff_all(self, altitude: float) -> Dict:
+        """Execute TAKEOFF command on all drones through consensus"""
+        command = f"TAKEOFF_ALL:{json.dumps({'altitude': altitude})}"
+        success = await self.replicate_command(command)
+        return {'success': success, 'command': 'TAKEOFF_ALL', 'altitude': altitude}
+    
+    async def execute_land_all(self) -> Dict:
+        """Execute LAND command on all drones through consensus"""
+        command = "LAND_ALL:{}"
+        success = await self.replicate_command(command)
+        return {'success': success, 'command': 'LAND_ALL'}
+    
+    async def execute_set_formation(self, parameters: Dict) -> Dict:
+        """Set formation for the swarm"""
+        formation_type = parameters.get('formation_type')
+        interval = parameters.get('interval', 10.0)
+        angle = parameters.get('angle', 0.0)
+        
+        # Calculate formation positions
+        positions = self.calculate_formation_positions(formation_type, interval, angle)
+        
+        success_count = 0
+        for i, (node_id, _) in enumerate(self.peers):
+            if i < len(positions):
+                position = positions[i]
+                command = f"SET_FORMATION:{json.dumps({'formation_type': formation_type, 'position': position})}"
+                if await self.replicate_command(command):
+                    success_count += 1
+        
+        return {
+            'success': success_count == len(self.peers),
+            'command': 'SET_FORMATION',
+            'formation_type': formation_type,
+            'positions_set': success_count
+        }
+    
+    async def execute_individual_command(self, target_node: str, command: str) -> Dict:
+        """Execute command on specific node"""
+        if target_node == self.node_id:
+            # Execute locally
+            success = await self.replicate_command(command)
+            return {'success': success, 'target': target_node, 'command': command}
+        else:
+            return {'error': 'Individual commands not implemented for remote nodes'}
+    
+    def calculate_formation_positions(self, formation_type: str, interval: float, angle: float = 0.0) -> List[Tuple[float, float]]:
+        """Calculate formation positions for drones"""
+        import math
+        
+        num_drones = len(self.peers)
+        positions = []
+        
+        if formation_type.lower() == 'line':
+            for i in range(num_drones):
+                x_offset = (i - (num_drones - 1) / 2) * interval
+                y_offset = 0
+                x = x_offset * math.cos(math.radians(angle)) - y_offset * math.sin(math.radians(angle))
+                y = x_offset * math.sin(math.radians(angle)) + y_offset * math.cos(math.radians(angle))
+                positions.append((x, y))
+        
+        elif formation_type.lower() == 'circle':
+            angle_step = 360.0 / num_drones
+            for i in range(num_drones):
+                drone_angle = math.radians(i * angle_step + angle)
+                x = interval * math.cos(drone_angle)
+                y = interval * math.sin(drone_angle)
+                positions.append((x, y))
+        
+        elif formation_type.lower() == 'triangle' and num_drones >= 3:
+            angles = [0, 120, 240, 60, 180]  # Support up to 5 drones
+            for i in range(min(num_drones, 5)):
+                drone_angle = math.radians(angles[i] + angle)
+                x = interval * math.cos(drone_angle)
+                y = interval * math.sin(drone_angle)
+                positions.append((x, y))
+        
+        else:
+            # Default to line formation
+            for i in range(num_drones):
+                x_offset = (i - (num_drones - 1) / 2) * interval
+                positions.append((x_offset, 0))
+        
+        return positions
+    
+    async def get_swarm_status(self) -> Dict:
+        """Get status of entire swarm"""
+        swarm_status = {
+            'leader': self.node_id,
+            'term': self.current_term,
+            'nodes': {}
+        }
+        
+        # Add own status
+        swarm_status['nodes'][self.node_id] = {
+            'state': self.state.value,
+            'drone_connected': self.drone_connected,
+            'drone_status': self.get_drone_status() if self.drone_connected else None,
+            'formation_state': self.swarm_state
+        }
+        
+        # TODO: Collect status from other nodes
+        return swarm_status
+    
+    def get_drone_status(self) -> Dict:
+        """Get drone status"""
+        if self.drone_connected:
+            return self.drone_controller.get_drone_status()
+        return {'connected': False}
+    
+    async def replicate_command(self, command: str) -> bool:
+        """Replicate command to all nodes through Raft consensus"""
+        if self.state != NodeState.LEADER:
+            return False
+        
+        # Create log entry
+        log_entry = LogEntry(
+            term=self.current_term,
+            index=len(self.log),
+            command=command
+        )
+        self.log.append(log_entry)
+        
+        # Send to followers
+        success_count = 1  # Count self
+        append_tasks = []
+        
+        for peer_id, peer_port in self.peers:
+            if peer_id != self.node_id:
+                task = asyncio.create_task(self.send_append_entries_with_entry(peer_id, peer_port, log_entry))
+                append_tasks.append(task)
+        
+        if append_tasks:
+            responses = await asyncio.gather(*append_tasks, return_exceptions=True)
+            
+            for response in responses:
+                if isinstance(response, AppendEntriesResponse) and response.success:
+                    success_count += 1
+        
+        # Check if majority succeeded
+        majority = len(self.peers) // 2 + 1
+        if success_count >= majority:
+            # Commit the entry
+            self.commit_index = log_entry.index
+            self.logger.info(f"Command committed: {command}")
+            return True
+        else:
+            # Remove the entry if not committed
+            self.log.pop()
+            self.logger.warning(f"Command failed to replicate: {command}")
+            return False
+    
+    async def send_append_entries_with_entry(self, peer_id: str, peer_port: int, entry: LogEntry) -> Optional[AppendEntriesResponse]:
+        """Send append entries with specific entry to a peer"""
+        try:
+            prev_log_index = entry.index - 1
+            prev_log_term = 0
+            if prev_log_index >= 0 and prev_log_index < len(self.log) - 1:
+                prev_log_term = self.log[prev_log_index].term
+            
+            # Convert LogEntry to dict for serialization
+            entry_dict = asdict(entry)
+            
+            append_request = AppendEntriesRequest(
+                term=self.current_term,
+                leader_id=self.node_id,
+                prev_log_index=prev_log_index,
+                prev_log_term=prev_log_term,
+                entries=[entry_dict],  # Send as dict, not LogEntry object
+                leader_commit=self.commit_index
+            )
+            
+            message = Message(
+                msg_type=MessageType.APPEND_ENTRIES.value,
+                data=asdict(append_request),
+                sender_id=self.node_id
+            )
+            
+            response_msg = await self.send_message_to_peer(peer_id, peer_port, message)
+            if response_msg and response_msg.msg_type == MessageType.APPEND_RESPONSE.value:
+                return AppendEntriesResponse(**response_msg.data)
+        
+        except Exception as e:
+            self.logger.debug(f"Failed to send append entries to {peer_id}: {e}")
+        
+        return None
+    
+    # ... (Rest of the Raft implementation methods remain the same as in the original raft_node.py)
+    # Including: send_message_to_peer, election_timer, start_election, etc.
+    
     async def send_message_to_peer(self, peer_id: str, peer_port: int, message: Message) -> Optional[Message]:
         """Send message to a peer and wait for response"""
         try:
-            # Create connection
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection('localhost', peer_port),
                 timeout=1.0
             )
             
             try:
-                # Send message
                 await SocketProtocol.send_message(writer, message)
-                
-                # Wait for response
                 response = await asyncio.wait_for(
                     SocketProtocol.receive_message(reader),
                     timeout=1.0
                 )
-                
                 return response
             finally:
                 writer.close()
@@ -262,7 +679,7 @@ class RaftNode:
         """Monitor election timeout and start elections"""
         while True:
             try:
-                await asyncio.sleep(0.1)  # Check every 100ms
+                await asyncio.sleep(0.1)
                 
                 if self.state != NodeState.LEADER:
                     time_since_heartbeat = time.time() - self.last_heartbeat
@@ -275,25 +692,21 @@ class RaftNode:
         """Start a new election"""
         self.logger.info(f"Starting election for term {self.current_term + 1}")
         
-        # Transition to candidate
         self.state = NodeState.CANDIDATE
         self.current_term += 1
         self.voted_for = self.node_id
         self.last_heartbeat = time.time()
         self.election_timeout = self._random_election_timeout()
         
-        # Vote for self
         votes_received = 1
         votes_needed = len(self.peers) // 2 + 1
         
-        # Request votes from peers
         vote_tasks = []
         for peer_id, peer_port in self.peers:
             if peer_id != self.node_id:
                 task = asyncio.create_task(self.request_vote_from_peer(peer_id, peer_port))
                 vote_tasks.append(task)
         
-        # Wait for vote responses
         if vote_tasks:
             responses = await asyncio.gather(*vote_tasks, return_exceptions=True)
             
@@ -302,11 +715,9 @@ class RaftNode:
                     if response.vote_granted:
                         votes_received += 1
                     elif response.term > self.current_term:
-                        # Found higher term, step down
                         await self.step_down(response.term)
                         return
         
-        # Check if won election
         if self.state == NodeState.CANDIDATE and votes_received >= votes_needed:
             await self.become_leader()
         else:
@@ -346,13 +757,11 @@ class RaftNode:
         self.logger.info(f"Became leader for term {self.current_term}")
         self.state = NodeState.LEADER
         
-        # Initialize leader state
         for peer_id, _ in self.peers:
             if peer_id != self.node_id:
                 self.next_index[peer_id] = len(self.log)
                 self.match_index[peer_id] = -1
         
-        # Start sending heartbeats
         if self.heartbeat_task:
             self.heartbeat_task.cancel()
         self.heartbeat_task = asyncio.create_task(self.send_heartbeats())
@@ -361,7 +770,6 @@ class RaftNode:
         """Send periodic heartbeats to followers"""
         while self.state == NodeState.LEADER:
             try:
-                # Send heartbeat to all peers
                 heartbeat_tasks = []
                 for peer_id, peer_port in self.peers:
                     if peer_id != self.node_id:
@@ -383,8 +791,14 @@ class RaftNode:
             if prev_log_index >= 0 and prev_log_index < len(self.log):
                 prev_log_term = self.log[prev_log_index].term
             
-            # For heartbeat, send empty entries
+            # For heartbeat, send empty entries (or pending entries)
             entries = []
+            
+            # If there are entries to replicate to this peer
+            next_idx = self.next_index.get(peer_id, len(self.log))
+            if next_idx < len(self.log):
+                # Send pending entries as dicts
+                entries = [asdict(entry) for entry in self.log[next_idx:]]
             
             append_request = AppendEntriesRequest(
                 term=self.current_term,
@@ -404,6 +818,16 @@ class RaftNode:
             response_msg = await self.send_message_to_peer(peer_id, peer_port, message)
             if response_msg and response_msg.msg_type == MessageType.APPEND_RESPONSE.value:
                 append_response = AppendEntriesResponse(**response_msg.data)
+                
+                if append_response.success:
+                    # Update next_index and match_index for successful replication
+                    if entries:
+                        self.next_index[peer_id] = len(self.log)
+                        self.match_index[peer_id] = len(self.log) - 1
+                else:
+                    # Decrement next_index on failure for log consistency
+                    if peer_id in self.next_index and self.next_index[peer_id] > 0:
+                        self.next_index[peer_id] -= 1
                 
                 if append_response.term > self.current_term:
                     await self.step_down(append_response.term)
@@ -427,15 +851,12 @@ class RaftNode:
         """Handle incoming vote request"""
         vote_granted = False
         
-        # Reply false if term < currentTerm
         if vote_request.term < self.current_term:
             pass
         else:
-            # Update term if necessary
             if vote_request.term > self.current_term:
                 await self.step_down(vote_request.term)
             
-            # Check if we can grant vote
             last_log_index = len(self.log) - 1 if self.log else -1
             last_log_term = self.log[-1].term if self.log else 0
             
@@ -446,30 +867,62 @@ class RaftNode:
             if (self.voted_for is None or self.voted_for == vote_request.candidate_id) and log_ok:
                 vote_granted = True
                 self.voted_for = vote_request.candidate_id
-                self.last_heartbeat = time.time()  # Reset election timer
+                self.last_heartbeat = time.time()
         
         self.logger.debug(f"Vote request from {vote_request.candidate_id}: granted={vote_granted}")
         return VoteResponse(term=self.current_term, vote_granted=vote_granted)
     
     async def handle_append_entries(self, append_request: AppendEntriesRequest) -> AppendEntriesResponse:
-        """Handle incoming append entries (heartbeat)"""
+        """Handle incoming append entries"""
         success = False
         
-        # Reply false if term < currentTerm
         if append_request.term < self.current_term:
+            # Reply false if term < currentTerm
             pass
         else:
-            # Update term and step down if necessary
             if append_request.term > self.current_term:
                 await self.step_down(append_request.term)
             
-            # Valid leader for this term
             self.last_heartbeat = time.time()
             if self.state == NodeState.CANDIDATE:
                 self.state = NodeState.FOLLOWER
             
-            success = True
-            self.logger.debug(f"Heartbeat from leader {append_request.leader_id}")
+            # Check log consistency
+            if (append_request.prev_log_index == -1 or 
+                (append_request.prev_log_index < len(self.log) and 
+                 len(self.log) > append_request.prev_log_index and
+                 self.log[append_request.prev_log_index].term == append_request.prev_log_term)):
+                
+                success = True
+                
+                # Append new entries if any
+                if append_request.entries:
+                    start_index = append_request.prev_log_index + 1
+                    
+                    # Remove conflicting entries
+                    if start_index < len(self.log):
+                        self.log = self.log[:start_index]
+                    
+                    # Append new entries (they come as dicts, convert to LogEntry)
+                    for entry_data in append_request.entries:
+                        if isinstance(entry_data, dict):
+                            entry = LogEntry(**entry_data)
+                        else:
+                            # Should not happen, but handle gracefully
+                            entry = entry_data
+                        
+                        self.log.append(entry)
+                        self.logger.debug(f"Appended log entry: {entry.command}")
+                
+                # Update commit index
+                if append_request.leader_commit > self.commit_index:
+                    self.commit_index = min(append_request.leader_commit, len(self.log) - 1)
+                    self.logger.debug(f"Updated commit index to: {self.commit_index}")
+            
+            else:
+                self.logger.debug(f"Log consistency check failed. prev_log_index: {append_request.prev_log_index}, log_length: {len(self.log)}")
+            
+            self.logger.debug(f"Append entries from leader {append_request.leader_id}: success={success}, entries={len(append_request.entries)}")
         
         return AppendEntriesResponse(term=self.current_term, success=success)
     
@@ -479,19 +932,17 @@ class RaftNode:
             return {'error': 'Not leader', 'leader_id': None}
         
         command = request_data.get('command', '')
+        success = await self.replicate_command(command)
         
-        # Add to log (simplified - in real implementation would replicate to followers)
-        log_entry = LogEntry(
-            term=self.current_term,
-            index=len(self.log),
-            command=command
-        )
-        self.log.append(log_entry)
-        
-        return {'success': True, 'index': log_entry.index}
+        if success:
+            return {'success': True, 'index': len(self.log) - 1}
+        else:
+            return {'error': 'Failed to replicate command'}
     
     async def handle_status_request(self) -> Dict:
         """Handle status request"""
+        drone_status = self.get_drone_status() if self.drone_connected else None
+        
         return {
             'node_id': self.node_id,
             'state': self.state.value,
@@ -499,11 +950,15 @@ class RaftNode:
             'voted_for': self.voted_for,
             'log_length': len(self.log),
             'commit_index': self.commit_index,
-            'port': self.port
+            'port': self.port,
+            'drone_index': self.drone_index,
+            'drone_connected': self.drone_connected,
+            'drone_status': drone_status,
+            'swarm_state': self.swarm_state
         }
     
     async def stop(self):
-        """Stop the node"""
+        """Stop the node and disconnect drone"""
         if self.server:
             self.server.close()
             await self.server.wait_closed()
@@ -513,18 +968,29 @@ class RaftNode:
         
         if self.election_task:
             self.election_task.cancel()
+        
+        if self.drone_monitor_task:
+            self.drone_monitor_task.cancel()
+        
+        if self.drone_controller:
+            self.drone_controller.cleanup()
 
-# Client utilities for testing
-class RaftClient:
-    """Simple client for interacting with Raft cluster"""
+# Client utilities for swarm control
+class RaftDroneClient:
+    """Client for interacting with Raft-Drone cluster"""
     
     @staticmethod
-    async def send_client_request(host: str, port: int, command: str) -> Optional[Dict]:
-        """Send a client request to a Raft node"""
+    async def send_swarm_command(host: str, port: int, command_type: str, parameters: Dict = None) -> Optional[Dict]:
+        """Send a swarm command to the cluster leader"""
         try:
+            swarm_command = SwarmCommand(
+                command_type=command_type,
+                parameters=parameters or {}
+            )
+            
             message = Message(
-                msg_type=MessageType.CLIENT_REQUEST.value,
-                data={'command': command},
+                msg_type=MessageType.SWARM_COMMAND.value,
+                data=asdict(swarm_command),
                 sender_id='client'
             )
             
@@ -533,20 +999,20 @@ class RaftClient:
                 await SocketProtocol.send_message(writer, message)
                 response = await SocketProtocol.receive_message(reader)
                 
-                if response and response.msg_type == MessageType.CLIENT_RESPONSE.value:
+                if response and response.msg_type == MessageType.SWARM_RESPONSE.value:
                     return response.data
             finally:
                 writer.close()
                 await writer.wait_closed()
         
         except Exception as e:
-            logging.error(f"Client request failed: {e}")
+            logging.error(f"Swarm command failed: {e}")
         
         return None
     
     @staticmethod
     async def get_node_status(host: str, port: int) -> Optional[Dict]:
-        """Get status from a Raft node"""
+        """Get status from a Raft-Drone node"""
         try:
             message = Message(
                 msg_type=MessageType.STATUS_REQUEST.value,
@@ -569,41 +1035,50 @@ class RaftClient:
             logging.debug(f"Status request failed: {e}")
         
         return None
+    
+    @staticmethod
+    async def find_leader(ports: List[int]) -> Optional[Tuple[str, int]]:
+        """Find the current leader in the cluster"""
+        for port in ports:
+            status = await RaftDroneClient.get_node_status('localhost', port)
+            if status and status.get('state') == 'leader':
+                return status.get('node_id'), port
+        return None
 
-async def create_single_node(port: int):
-    """Create and start a single Raft node"""
-    # Define the cluster topology
+async def create_single_raft_drone_node(port: int):
+    """Create and start a single Raft-Drone node"""
     ports = [8000, 8001, 8002, 8003, 8004]
-    node_ids = ['node1', 'node2', 'node3', 'node4', 'node5']
+    node_ids = ['drone1', 'drone2', 'drone3', 'drone4', 'drone5']
     
     # Create peer list for the entire cluster
     peers = [(node_id, p) for node_id, p in zip(node_ids, ports)]
     
-    # Find the node_id for this port
+    # Find the node_id and drone_index for this port
     try:
         port_index = ports.index(port)
         node_id = node_ids[port_index]
+        drone_index = port_index
     except ValueError:
         raise ValueError(f"Port {port} not in allowed ports: {ports}")
     
     # Create and start the node
-    node = RaftNode(node_id, port, peers)
+    node = RaftDroneNode(node_id, port, drone_index, peers)
     await node.start()
     
     return node
 
-async def create_cluster():
-    """Create and start a 5-node Raft cluster (for testing)"""
+async def create_raft_drone_cluster():
+    """Create and start a 5-node Raft-Drone cluster"""
     nodes = []
     ports = [8000, 8001, 8002, 8003, 8004]
-    node_ids = ['node1', 'node2', 'node3', 'node4', 'node5']
+    node_ids = ['drone1', 'drone2', 'drone3', 'drone4', 'drone5']
     
     # Create peer list
     peers = [(node_id, port) for node_id, port in zip(node_ids, ports)]
     
     # Create nodes
     for i, (node_id, port) in enumerate(zip(node_ids, ports)):
-        node = RaftNode(node_id, port, peers)
+        node = RaftDroneNode(node_id, port, i, peers)
         nodes.append(node)
     
     # Start all nodes
@@ -612,83 +1087,46 @@ async def create_cluster():
     
     return nodes
 
-async def simulate_leader_failure(nodes: List[RaftNode]):
-    """Simulate leader failure scenario"""
-    print("\n=== Starting Leader Failure Simulation ===")
+async def test_swarm_operations():
+    """Test swarm operations"""
+    print("\n=== Testing Swarm Operations ===")
     
-    # Wait for initial leader election
-    await asyncio.sleep(5)
-    
-    # Find current leader
-    leader = None
-    for node in nodes:
-        if node.state == NodeState.LEADER:
-            leader = node
-            break
-    
-    if leader:
-        print(f"\nCurrent leader: {leader.node_id} (term {leader.current_term})")
-        print("Simulating leader failure...")
-        
-        # Simulate leader failure by stopping heartbeats
-        if leader.heartbeat_task:
-            leader.heartbeat_task.cancel()
-        leader.state = NodeState.FOLLOWER  # Force step down
-        
-        print("Leader failed! Waiting for new leader election...")
-        
-        # Wait for new leader election
-        await asyncio.sleep(8)
-        
-        # Check new leader
-        new_leader = None
-        for node in nodes:
-            if node.state == NodeState.LEADER:
-                new_leader = node
-                break
-        
-        if new_leader:
-            print(f"New leader elected: {new_leader.node_id} (term {new_leader.current_term})")
-        else:
-            print("No new leader elected yet")
-    else:
-        print("No leader found initially")
-
-async def print_cluster_status(nodes: List[RaftNode]):
-    """Print status of all nodes"""
-    print("\n=== Cluster Status ===")
-    for node in nodes:
-        print(f"{node.node_id}: state={node.state.value}, term={node.current_term}, "
-              f"voted_for={node.voted_for}, port={node.port}")
-
-async def test_client_operations():
-    """Test client operations"""
-    print("\n=== Testing Client Operations ===")
-    
-    # Try to find leader and send request
     ports = [8000, 8001, 8002, 8003, 8004]
     
-    for port in ports:
-        status = await RaftClient.get_node_status('localhost', port)
-        if status and status.get('state') == 'leader':
-            print(f"Found leader on port {port}")
-            
-            # Send client request
-            result = await RaftClient.send_client_request('localhost', port, 'set x=100')
-            if result:
-                print(f"Client request result: {result}")
-            break
-    else:
-        print("No leader found for client request")
+    # Find leader
+    leader_info = await RaftDroneClient.find_leader(ports)
+    if not leader_info:
+        print("No leader found!")
+        return
+    
+    leader_id, leader_port = leader_info
+    print(f"Found leader: {leader_id} on port {leader_port}")
+    
+    # Test swarm commands
+    commands = [
+        ('connect_all', {}),
+        ('arm_all', {}),
+        ('takeoff_all', {'altitude': 10.0}),
+        ('set_formation', {'formation_type': 'circle', 'interval': 20.0, 'angle': 0.0}),
+        ('get_swarm_status', {}),
+    ]
+    
+    for cmd_type, params in commands:
+        print(f"\nExecuting: {cmd_type}")
+        result = await RaftDroneClient.send_swarm_command('localhost', leader_port, cmd_type, params)
+        print(f"Result: {result}")
+        await asyncio.sleep(2)  # Wait between commands
 
-async def run_single_node(port: int):
-    """Run a single Raft node"""
-    print(f"Starting Raft node on port {port}")
+async def run_single_raft_drone_node(port: int):
+    """Run a single Raft-Drone node"""
+    print(f"Starting Raft-Drone node on port {port}")
     print(f"Cluster ports: 8000, 8001, 8002, 8003, 8004")
+    print(f"Drone connections: {DRONE_CONNECTIONS}")
     
     try:
-        node = await create_single_node(port)
+        node = await create_single_raft_drone_node(port)
         print(f"Node {node.node_id} is running on port {port}")
+        print(f"Controlling drone {node.drone_index} ({DRONE_CONNECTIONS[node.drone_index]})")
         print("Waiting for other nodes to join the cluster...")
         print("Press Ctrl+C to stop this node")
         
@@ -703,32 +1141,25 @@ async def run_single_node(port: int):
         print(f"Error: {e}")
 
 async def run_test_cluster():
-    """Run full cluster for testing (original behavior)"""
-    print("Starting 5-node Raft cluster with TCP sockets...")
-    nodes = await create_cluster()
+    """Run full cluster for testing"""
+    print("Starting 5-node Raft-Drone cluster...")
+    print(f"Drone connections: {DRONE_CONNECTIONS}")
+    
+    nodes = await create_raft_drone_cluster()
     
     try:
-        # Monitor cluster for a while
-        for i in range(3):
-            await asyncio.sleep(3)
-            await print_cluster_status(nodes)
+        # Wait for leader election
+        print("Waiting for leader election...")
+        await asyncio.sleep(5)
         
-        # Test client operations
-        await test_client_operations()
-        
-        # Simulate leader failure
-        await simulate_leader_failure(nodes)
-        
-        # Continue monitoring
-        for i in range(3):
-            await asyncio.sleep(3)
-            await print_cluster_status(nodes)
+        # Test swarm operations
+        await test_swarm_operations()
         
         print("\nCluster is running. You can test with:")
         print("python -c \"")
         print("import asyncio")
-        print("from raft_node import RaftClient")
-        print("print(asyncio.run(RaftClient.get_node_status('localhost', 8000)))")
+        print("from raft_drone_node import RaftDroneClient")
+        print("print(asyncio.run(RaftDroneClient.get_node_status('localhost', 8000)))")
         print("\"")
         print("\nPress Ctrl+C to stop")
         
@@ -738,29 +1169,42 @@ async def run_test_cluster():
             
     except KeyboardInterrupt:
         print("\nShutting down cluster...")
-        # Clean shutdown
         for node in nodes:
             await node.stop()
 
 def print_usage():
     """Print usage instructions"""
-    print("Raft Consensus Algorithm - Socket Implementation")
+    print("Raft-Drone Consensus System")
+    print()
+    print("Integration of Raft consensus algorithm with drone swarm control")
+    print("Each Raft node controls one drone for coordinated swarm operations")
     print()
     print("Usage:")
-    print("  python raft_node.py <port>        # Run single node on specified port")
-    print("  python raft_node.py --test        # Run full cluster for testing")
+    print("  python raft_drone_node.py <port>        # Run single node on specified port")
+    print("  python raft_drone_node.py --test        # Run full cluster for testing")
     print()
     print("Single Node Mode:")
     print("  Available ports: 8000, 8001, 8002, 8003, 8004")
+    print("  Corresponding drones: 0, 1, 2, 3, 4")
     print("  Example:")
-    print("    Terminal 1: python raft_node.py 8000")
-    print("    Terminal 2: python raft_node.py 8001")
-    print("    Terminal 3: python raft_node.py 8002")
-    print("    Terminal 4: python raft_node.py 8003")
-    print("    Terminal 5: python raft_node.py 8004")
+    print("    Terminal 1: python raft_drone_node.py 8000  # Controls drone 0")
+    print("    Terminal 2: python raft_drone_node.py 8001  # Controls drone 1")
+    print("    Terminal 3: python raft_drone_node.py 8002  # Controls drone 2")
+    print("    Terminal 4: python raft_drone_node.py 8003  # Controls drone 3")
+    print("    Terminal 5: python raft_drone_node.py 8004  # Controls drone 4")
     print()
-    print("Client Testing:")
-    print("  python -c \"import asyncio; from raft_node import RaftClient; print(asyncio.run(RaftClient.get_node_status('localhost', 8000)))\"")
+    print("Drone Connections:")
+    for i, conn in enumerate(DRONE_CONNECTIONS):
+        print(f"  Drone {i}: {conn}")
+    print()
+    print("Swarm Commands (send to leader):")
+    print("  CONNECT_ALL    - Connect all nodes to their drones")
+    print("  ARM_ALL        - Arm all drones")
+    print("  DISARM_ALL     - Disarm all drones")
+    print("  TAKEOFF_ALL    - Take off all drones")
+    print("  LAND_ALL       - Land all drones")
+    print("  SET_FORMATION  - Set swarm formation")
+    print("  GET_SWARM_STATUS - Get status of all drones")
 
 async def main():
     """Main function with command line argument parsing"""
@@ -783,7 +1227,7 @@ async def main():
                 print(f"Error: Port must be one of: 8000, 8001, 8002, 8003, 8004")
                 print("Use --help for usage information")
                 return
-            await run_single_node(port)
+            await run_single_raft_drone_node(port)
         except ValueError:
             print(f"Error: Invalid port '{arg}'. Must be a number.")
             print("Use --help for usage information")
