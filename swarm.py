@@ -28,7 +28,7 @@ class SwarmCLI:
         """Send command to the leader"""
         if not self.current_leader_port:
             if not await self.find_leader():
-                click.echo("❌ No leader found in cluster")
+                click.echo("ERROR: No leader found in cluster")
                 return None
         
         result = await RaftDroneClient.send_swarm_command(
@@ -66,7 +66,7 @@ swarm_cli = SwarmCLI()
 
 @click.group()
 def cli():
-    """🚁 Raft-Drone Swarm Control CLI
+    """Raft-Drone Swarm Control CLI
     
     Control a distributed drone swarm using Raft consensus algorithm.
     Each drone is controlled by a Raft node for fault-tolerant coordination.
@@ -75,8 +75,8 @@ def cli():
 
 @cli.command()
 async def status():
-    """📊 Show status of all nodes and drones in the cluster"""
-    click.echo("🔍 Checking cluster status...")
+    """Show status of all nodes and drones in the cluster"""
+    click.echo("Checking cluster status...")
     
     cluster_status = await swarm_cli.get_cluster_status()
     
@@ -97,23 +97,23 @@ async def status():
             node_id = status['node_id']
             state = status['state'].upper()
             term = status['term']
-            drone_connected = "✅" if status.get('drone_connected') else "❌"
+            drone_connected = "YES" if status.get('drone_connected') else "NO"
             
             if state == 'LEADER':
                 leader_node = node_id
-                click.echo(f"👑 {node_id:<8} | Port {port} | {state:<9} | Term {term:<3} | Drone {drone_connected}")
+                click.echo(f"[LEADER] {node_id:<8} | Port {port} | {state:<9} | Term {term:<3} | Drone {drone_connected}")
             else:
-                click.echo(f"   {node_id:<8} | Port {port} | {state:<9} | Term {term:<3} | Drone {drone_connected}")
+                click.echo(f"         {node_id:<8} | Port {port} | {state:<9} | Term {term:<3} | Drone {drone_connected}")
             
             # Show drone status if connected
             drone_status = status.get('drone_status')
             if drone_status and drone_status.get('connected'):
-                armed = "🟢 Armed" if drone_status.get('armed') else "🔴 Disarmed"
+                armed = "Armed" if drone_status.get('armed') else "Disarmed"
                 mode = drone_status.get('mode', 'Unknown')
                 alt = drone_status.get('altitude', 0)
-                click.echo(f"     └─ Drone: {armed} | Mode: {mode} | Alt: {alt:.1f}m")
+                click.echo(f"         Drone: {armed} | Mode: {mode} | Alt: {alt:.1f}m")
         else:
-            click.echo(f"   Node{port-7999:<4} | Port {port} | OFFLINE   | ---   | ---")
+            click.echo(f"         Node{port-7999:<4} | Port {port} | OFFLINE   | ---   | ---")
     
     click.echo("="*80)
     click.echo(f"Cluster: {online_nodes}/5 nodes online")
@@ -127,9 +127,9 @@ async def status():
 @click.option('--watch', '-w', is_flag=True, help='Continuously watch status')
 @click.option('--interval', '-i', default=2, help='Update interval for watch mode')
 async def monitor(watch, interval):
-    """📺 Monitor cluster status (use --watch for continuous monitoring)"""
+    """Monitor cluster status (use --watch for continuous monitoring)"""
     if watch:
-        click.echo("🖥️  Starting continuous monitoring (Press Ctrl+C to stop)...")
+        click.echo("Starting continuous monitoring (Press Ctrl+C to stop)...")
         try:
             while True:
                 # Clear screen
@@ -137,55 +137,55 @@ async def monitor(watch, interval):
                 await status.callback()
                 await asyncio.sleep(interval)
         except KeyboardInterrupt:
-            click.echo("\n👋 Monitoring stopped")
+            click.echo("\nMonitoring stopped")
     else:
         await status.callback()
 
 @cli.command()
 async def connect():
-    """🔗 Connect all nodes to their drones"""
-    click.echo("🔗 Connecting all drones...")
+    """Connect all nodes to their drones"""
+    click.echo("Connecting all drones...")
     
     result = await swarm_cli.send_command(SwarmCommandType.CONNECT_ALL.value)
     
     if result and result.get('success'):
-        click.echo("✅ Connect command processed")
+        click.echo("SUCCESS: Connect command processed")
     else:
-        click.echo(f"❌ Connect failed: {result.get('error') if result else 'No response'}")
+        click.echo(f"ERROR: Connect failed: {result.get('error') if result else 'No response'}")
 
 @cli.command()
 async def arm():
-    """🔓 Arm all drones in the swarm"""
-    click.echo("🔓 Arming all drones...")
+    """Arm all drones in the swarm"""
+    click.echo("Arming all drones...")
     
     result = await swarm_cli.send_command(SwarmCommandType.ARM_ALL.value)
     
     if result and result.get('success'):
-        click.echo("✅ All drones armed successfully")
+        click.echo("SUCCESS: All drones armed successfully")
     else:
-        click.echo(f"❌ Arm command failed: {result.get('error') if result else 'No response'}")
+        click.echo(f"ERROR: Arm command failed: {result.get('error') if result else 'No response'}")
 
 @cli.command()
 async def disarm():
-    """🔒 Disarm all drones in the swarm"""
-    click.echo("🔒 Disarming all drones...")
+    """Disarm all drones in the swarm"""
+    click.echo("Disarming all drones...")
     
     result = await swarm_cli.send_command(SwarmCommandType.DISARM_ALL.value)
     
     if result and result.get('success'):
-        click.echo("✅ All drones disarmed successfully")
+        click.echo("SUCCESS: All drones disarmed successfully")
     else:
-        click.echo(f"❌ Disarm command failed: {result.get('error') if result else 'No response'}")
+        click.echo(f"ERROR: Disarm command failed: {result.get('error') if result else 'No response'}")
 
 @cli.command()
 @click.argument('altitude', type=float)
 async def takeoff(altitude):
-    """🚀 Take off all drones to specified altitude (meters)"""
+    """Take off all drones to specified altitude (meters)"""
     if altitude <= 0:
-        click.echo("❌ Altitude must be positive")
+        click.echo("ERROR: Altitude must be positive")
         return
     
-    click.echo(f"🚀 Taking off all drones to {altitude}m...")
+    click.echo(f"Taking off all drones to {altitude}m...")
     
     result = await swarm_cli.send_command(
         SwarmCommandType.TAKEOFF_ALL.value,
@@ -193,37 +193,37 @@ async def takeoff(altitude):
     )
     
     if result and result.get('success'):
-        click.echo(f"✅ Takeoff command sent - target altitude: {altitude}m")
+        click.echo(f"SUCCESS: Takeoff command sent - target altitude: {altitude}m")
     else:
-        click.echo(f"❌ Takeoff failed: {result.get('error') if result else 'No response'}")
+        click.echo(f"ERROR: Takeoff failed: {result.get('error') if result else 'No response'}")
 
 @cli.command()
 async def land():
-    """🛬 Land all drones"""
-    click.echo("🛬 Landing all drones...")
+    """Land all drones"""
+    click.echo("Landing all drones...")
     
     result = await swarm_cli.send_command(SwarmCommandType.LAND_ALL.value)
     
     if result and result.get('success'):
-        click.echo("✅ Land command sent to all drones")
+        click.echo("SUCCESS: Land command sent to all drones")
     else:
-        click.echo(f"❌ Land command failed: {result.get('error') if result else 'No response'}")
+        click.echo(f"ERROR: Land command failed: {result.get('error') if result else 'No response'}")
 
 @cli.command()
 @click.argument('formation_type', type=click.Choice(['line', 'circle', 'triangle']))
 @click.argument('interval', type=float)
 @click.option('--angle', '-a', default=0.0, help='Formation rotation angle in degrees')
 async def formation(formation_type, interval, angle):
-    """✈️ Set swarm formation
+    """Set swarm formation
     
     FORMATION_TYPE: line, circle, or triangle
     INTERVAL: Distance between drones in meters
     """
     if interval <= 0:
-        click.echo("❌ Interval must be positive")
+        click.echo("ERROR: Interval must be positive")
         return
     
-    click.echo(f"✈️  Setting {formation_type} formation (interval: {interval}m, angle: {angle}°)...")
+    click.echo(f"Setting {formation_type} formation (interval: {interval}m, angle: {angle} degrees)...")
     
     result = await swarm_cli.send_command(
         SwarmCommandType.SET_FORMATION.value,
@@ -235,15 +235,15 @@ async def formation(formation_type, interval, angle):
     )
     
     if result and result.get('success'):
-        click.echo(f"✅ Formation set: {formation_type}")
+        click.echo(f"SUCCESS: Formation set: {formation_type}")
         click.echo(f"   Positions calculated for {result.get('positions_set', 0)} drones")
     else:
-        click.echo(f"❌ Formation command failed: {result.get('error') if result else 'No response'}")
+        click.echo(f"ERROR: Formation command failed: {result.get('error') if result else 'No response'}")
 
 @cli.command()
 async def swarm_status():
-    """📋 Get detailed swarm status from leader"""
-    click.echo("📋 Getting swarm status...")
+    """Get detailed swarm status from leader"""
+    click.echo("Getting swarm status...")
     
     result = await swarm_cli.send_command(SwarmCommandType.GET_SWARM_STATUS.value)
     
@@ -276,15 +276,15 @@ async def swarm_status():
                 alt = drone_status.get('altitude', 0)
                 click.echo(f"    Drone Status: {'Armed' if armed else 'Disarmed'} | {mode} | {alt:.1f}m")
     else:
-        click.echo("❌ Failed to get swarm status")
+        click.echo("ERROR: Failed to get swarm status")
 
 @cli.command()
 async def leader():
-    """👑 Find and display current leader information"""
-    click.echo("👑 Finding cluster leader...")
+    """Find and display current leader information"""
+    click.echo("Finding cluster leader...")
     
     if await swarm_cli.find_leader():
-        click.echo(f"✅ Current leader: {swarm_cli.current_leader} on port {swarm_cli.current_leader_port}")
+        click.echo(f"SUCCESS: Current leader: {swarm_cli.current_leader} on port {swarm_cli.current_leader_port}")
         
         # Get detailed status of leader
         status = await RaftDroneClient.get_node_status('localhost', swarm_cli.current_leader_port)
@@ -299,21 +299,21 @@ async def leader():
             else:
                 click.echo(f"   Drone: Not connected")
     else:
-        click.echo("❌ No leader found in cluster")
+        click.echo("ERROR: No leader found in cluster")
 
 @cli.command()
 @click.argument('command')
 async def raw(command):
-    """⚡ Send raw command to leader
+    """Send raw command to leader
     
     COMMAND: Raw command string to execute
     """
-    click.echo(f"⚡ Sending raw command: {command}")
+    click.echo(f"Sending raw command: {command}")
     
     # Send as a client request (not swarm command)
     if not swarm_cli.current_leader_port:
         if not await swarm_cli.find_leader():
-            click.echo("❌ No leader found")
+            click.echo("ERROR: No leader found")
             return
     
     try:
@@ -333,22 +333,22 @@ async def raw(command):
             if response and response.msg_type == MessageType.CLIENT_RESPONSE.value:
                 result = response.data
                 if result.get('success'):
-                    click.echo(f"✅ Command executed successfully")
+                    click.echo(f"SUCCESS: Command executed successfully")
                     click.echo(f"   Index: {result.get('index')}")
                 else:
-                    click.echo(f"❌ Command failed: {result.get('error')}")
+                    click.echo(f"ERROR: Command failed: {result.get('error')}")
             else:
-                click.echo("❌ No valid response received")
+                click.echo("ERROR: No valid response received")
         finally:
             writer.close()
             await writer.wait_closed()
     
     except Exception as e:
-        click.echo(f"❌ Error sending command: {e}")
+        click.echo(f"ERROR: Error sending command: {e}")
 
 @cli.command()
 async def scenario():
-    """🎬 Run demonstration scenarios"""
+    """Run demonstration scenarios"""
     scenarios = {
         '1': 'Basic swarm startup',
         '2': 'Formation flying',
@@ -356,7 +356,7 @@ async def scenario():
         '4': 'Full mission demo'
     }
     
-    click.echo("🎬 Available demonstration scenarios:")
+    click.echo("Available demonstration scenarios:")
     for key, desc in scenarios.items():
         click.echo(f"   {key}. {desc}")
     
@@ -373,7 +373,7 @@ async def scenario():
 
 async def scenario_basic_startup():
     """Basic swarm startup scenario"""
-    click.echo("\n🎬 Scenario 1: Basic Swarm Startup")
+    click.echo("\nScenario 1: Basic Swarm Startup")
     click.echo("="*50)
     
     steps = [
@@ -385,15 +385,15 @@ async def scenario_basic_startup():
     ]
     
     for step_name, step_func in steps:
-        click.echo(f"\n📍 Step: {step_name}")
+        click.echo(f"\nStep: {step_name}")
         await step_func()
         await asyncio.sleep(2)
     
-    click.echo("\n✅ Basic startup scenario complete!")
+    click.echo("\nBasic startup scenario complete!")
 
 async def scenario_formation_flying():
     """Formation flying demonstration"""
-    click.echo("\n🎬 Scenario 2: Formation Flying")
+    click.echo("\nScenario 2: Formation Flying")
     click.echo("="*50)
     
     formations = [
@@ -403,7 +403,7 @@ async def scenario_formation_flying():
     ]
     
     # Initial setup
-    click.echo("\n📍 Initial setup...")
+    click.echo("\nInitial setup...")
     await connect.callback()
     await asyncio.sleep(1)
     await arm.callback()
@@ -413,24 +413,24 @@ async def scenario_formation_flying():
     
     # Try different formations
     for form_type, interval, angle in formations:
-        click.echo(f"\n📍 Setting {form_type} formation...")
+        click.echo(f"\nSetting {form_type} formation...")
         await formation.callback(form_type, interval, angle)
         await asyncio.sleep(3)
         await status.callback()
         await asyncio.sleep(2)
     
-    click.echo("\n✅ Formation flying scenario complete!")
+    click.echo("\nFormation flying scenario complete!")
 
 async def scenario_leader_failure():
     """Leader failure simulation"""
-    click.echo("\n🎬 Scenario 3: Leader Failure Simulation")
+    click.echo("\nScenario 3: Leader Failure Simulation")
     click.echo("="*50)
     
-    click.echo("\n📍 Finding current leader...")
+    click.echo("\nFinding current leader...")
     await leader.callback()
     
     if swarm_cli.current_leader_port:
-        click.echo(f"\n⚠️  Simulating leader failure on port {swarm_cli.current_leader_port}")
+        click.echo(f"\nSimulating leader failure on port {swarm_cli.current_leader_port}")
         click.echo("   (In real scenario, you would kill the leader process)")
         click.echo("   Waiting for re-election...")
         
@@ -441,11 +441,11 @@ async def scenario_leader_failure():
         await asyncio.sleep(5)
         await leader.callback()
     
-    click.echo("\n✅ Leader failure scenario complete!")
+    click.echo("\nLeader failure scenario complete!")
 
 async def scenario_full_mission():
     """Full mission demonstration"""
-    click.echo("\n🎬 Scenario 4: Full Mission Demo")
+    click.echo("\nScenario 4: Full Mission Demo")
     click.echo("="*50)
     
     mission_steps = [
@@ -461,10 +461,10 @@ async def scenario_full_mission():
         ("Final status", lambda: status.callback())
     ]
     
-    click.echo(f"\n🚁 Starting full mission with {len(mission_steps)} steps...")
+    click.echo(f"\nStarting full mission with {len(mission_steps)} steps...")
     
     for i, (step_name, step_func) in enumerate(mission_steps, 1):
-        click.echo(f"\n📍 Step {i}/{len(mission_steps)}: {step_name}")
+        click.echo(f"\nStep {i}/{len(mission_steps)}: {step_name}")
         await step_func()
         
         if i < len(mission_steps):
@@ -472,13 +472,13 @@ async def scenario_full_mission():
             click.echo(f"   Waiting {wait_time}s before next step...")
             await asyncio.sleep(wait_time)
     
-    click.echo("\n🎉 Full mission scenario complete!")
+    click.echo("\nFull mission scenario complete!")
 
 @cli.command()
 @click.option('--format', 'output_format', default='table', type=click.Choice(['table', 'json']), help='Output format')
 async def logs(output_format):
-    """📜 Show cluster logs and commit history"""
-    click.echo("📜 Retrieving cluster logs...")
+    """Show cluster logs and commit history"""
+    click.echo("Retrieving cluster logs...")
     
     cluster_status = await swarm_cli.get_cluster_status()
     logs_data = {}
@@ -511,19 +511,19 @@ async def logs(output_format):
 
 @cli.command()
 async def health():
-    """🏥 Perform cluster health check"""
-    click.echo("🏥 Performing cluster health check...")
+    """Perform cluster health check"""
+    click.echo("Performing cluster health check...")
     
     # Check node connectivity
     cluster_status = await swarm_cli.get_cluster_status()
     online_nodes = sum(1 for node in cluster_status if node['status'])
     total_nodes = len(cluster_status)
     
-    click.echo(f"\n📊 Connectivity: {online_nodes}/{total_nodes} nodes online")
+    click.echo(f"\nConnectivity: {online_nodes}/{total_nodes} nodes online")
     
     # Check leader status
     leader_found = await swarm_cli.find_leader()
-    click.echo(f"👑 Leadership: {'Healthy' if leader_found else 'No leader found'}")
+    click.echo(f"Leadership: {'Healthy' if leader_found else 'No leader found'}")
     
     # Check drone connections
     drone_connections = 0
@@ -537,8 +537,8 @@ async def health():
             if drone_status.get('armed'):
                 armed_drones += 1
     
-    click.echo(f"🚁 Drone Connectivity: {drone_connections}/{total_nodes} drones connected")
-    click.echo(f"🔓 Drone Readiness: {armed_drones}/{drone_connections} connected drones armed")
+    click.echo(f"Drone Connectivity: {drone_connections}/{total_nodes} drones connected")
+    click.echo(f"Drone Readiness: {armed_drones}/{drone_connections} connected drones armed")
     
     # Overall health assessment
     health_score = 0
@@ -551,16 +551,16 @@ async def health():
     if armed_drones == drone_connections and drone_connections > 0:
         health_score += 20  # All connected drones armed
     
-    click.echo(f"\n🎯 Overall Health Score: {health_score}/100")
+    click.echo(f"\nOverall Health Score: {health_score}/100")
     
     if health_score >= 80:
-        click.echo("✅ Cluster is healthy and ready for operations")
+        click.echo("SUCCESS: Cluster is healthy and ready for operations")
     elif health_score >= 60:
-        click.echo("⚠️  Cluster has minor issues but is operational")
+        click.echo("WARNING: Cluster has minor issues but is operational")
     elif health_score >= 40:
-        click.echo("⚠️  Cluster has significant issues - limited functionality")
+        click.echo("WARNING: Cluster has significant issues - limited functionality")
     else:
-        click.echo("❌ Cluster is unhealthy - operations not recommended")
+        click.echo("ERROR: Cluster is unhealthy - operations not recommended")
 
 # Async wrapper for click commands
 def async_command(f):
