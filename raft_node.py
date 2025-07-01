@@ -302,10 +302,33 @@ class RaftDroneNode:
                 result = await loop.run_in_executor(None, self.drone_controller.fly_to_here, distance, angle)
                 self.logger.info(f"Applied FLY_TO command to drone {self.drone_index}: {distance}m at {angle}° - {'SUCCESS' if result else 'FAILED'}")
             
-            elif cmd_type == "SET_FORMATION":
-                self.swarm_state['formation_type'] = data.get('formation_type')
-                self.swarm_state['formation_position'] = data.get('position')
-                self.logger.info(f"Set formation position for drone {self.drone_index}")
+            elif cmd_type == "SET_FORMATION_ALL":
+                # NEW WAY - Each node gets only its assigned position
+                formation_type = data.get('formation_type')
+                assignments = data.get('assignments', {})
+                
+                # Find this node's assignment
+                my_position = assignments.get(self.node_id)
+                if my_position:
+                    self.swarm_state['formation_type'] = formation_type
+                    self.swarm_state['formation_position'] = my_position
+                    self.logger.info(f"Set formation position for {self.node_id} (drone {self.drone_index}): {my_position}")
+                else:
+                    self.logger.warning(f"No formation position assigned to {self.node_id}")    
+            
+            elif cmd_type == "EXECUTE_INDIVIDUAL_FORMATION":
+                # Execute formation movement for this specific node
+                position = self.swarm_state.get('formation_position')
+                if position:
+                    x, y = position
+                    import math
+                    distance = math.sqrt(x*x + y*y)
+                    angle = math.degrees(math.atan2(y, x))
+                    
+                    result = await loop.run_in_executor(None, self.drone_controller.fly_to_here, distance, angle)
+                    self.logger.info(f"Applied FORMATION FLY_TO command to drone {self.drone_index}: {distance:.1f}m at {angle:.1f}° - {'SUCCESS' if result else 'FAILED'}")
+                else:
+                    self.logger.warning(f"No formation position to execute for drone {self.drone_index}")
             
             else:
                 self.logger.warning(f"Unknown command type: {cmd_type}")
@@ -428,6 +451,9 @@ class RaftDroneNode:
             elif swarm_cmd.command_type == SwarmCommandType.SET_FORMATION.value:
                 return await self.execute_set_formation(swarm_cmd.parameters)
             
+            elif swarm_cmd.command_type == SwarmCommandType.EXECUTE_FORMATION.value:
+                return await self.execute_formation_movement()  # Add this case
+
             elif swarm_cmd.command_type == SwarmCommandType.GET_SWARM_STATUS.value:
                 return await self.get_swarm_status()
             
@@ -476,29 +502,87 @@ class RaftDroneNode:
         return {'success': success, 'command': 'LAND_ALL'}
     
     async def execute_set_formation(self, parameters: Dict) -> Dict:
-        """Set formation for the swarm"""
+        """Set formation for the swarm - CORRECTED VERSION"""
         formation_type = parameters.get('formation_type')
         interval = parameters.get('interval', 10.0)
         angle = parameters.get('angle', 0.0)
+        execute_immediately = parameters.get('execute', False)
         
         # Calculate formation positions
         positions = self.calculate_formation_positions(formation_type, interval, angle)
-        
-        success_count = 0
+        self.logger.debug(f"Calculate result positions: {positions}")
+
+        # Create assignments for each node
+        formation_assignment = {}
         for i, (node_id, _) in enumerate(self.peers):
             if i < len(positions):
-                position = positions[i]
-                command = f"SET_FORMATION:{json.dumps({'formation_type': formation_type, 'position': position})}"
+                formation_assignment[node_id] = positions[i]
+        
+        # Send SINGLE command with ALL assignments
+        command = f"SET_FORMATION_ALL:{json.dumps({
+            'formation_type': formation_type, 
+            'assignments': formation_assignment
+        })}"
+        
+        success = await self.replicate_command(command)
+        
+        result = {
+            'success': success,
+            'command': 'SET_FORMATION',
+            'formation_type': formation_type,
+            'positions_set': len(formation_assignment) if success else 0
+        }
+        
+        if execute_immediately and success:
+            await asyncio.sleep(1)
+            execute_result = await self.execute_formation_movement()
+            result['movement_executed'] = execute_result['success']
+            result['moved_nodes'] = execute_result.get('moved_nodes', 0)
+        
+        return result
+    
+    async def execute_formation_movement(self) -> Dict:
+        """Execute movement to formation positions"""
+        success_count = 0
+        total_nodes = len(self.peers)
+        
+        # For each node (including self), send fly command based on their formation position
+        for i, (node_id, _) in enumerate(self.peers):
+            # Check if this node has a formation position set
+            if node_id == self.node_id:
+                # Handle own movement
+                position = self.swarm_state.get('formation_position')
+                if position:
+                    x, y = position
+                    # Convert cartesian position to distance and angle
+                    import math
+                    distance = math.sqrt(x*x + y*y)
+                    angle = math.degrees(math.atan2(y, x))
+                    
+                    command = f"FLY_TO:{json.dumps({'distance': distance, 'angle': angle})}"
+                    if await self.replicate_command(command):
+                        success_count += 1
+                        self.logger.info(f"Executing formation movement: distance={distance:.1f}m, angle={angle:.1f}°")
+                else:
+                    self.logger.warning(f"No formation position set for {node_id}")
+            else:
+                # For other nodes, we need to send them their specific movement command
+                # This is a simplified approach - in a full implementation, you'd calculate 
+                # each node's position and send individual commands
+                
+                # For now, we'll assume each node will execute based on their stored formation position
+                # when they receive the EXECUTE_FORMATION command via consensus
+                command = f"EXECUTE_INDIVIDUAL_FORMATION:{json.dumps({'node_id': node_id})}"
                 if await self.replicate_command(command):
                     success_count += 1
         
         return {
-            'success': success_count == len(self.peers),
-            'command': 'SET_FORMATION',
-            'formation_type': formation_type,
-            'positions_set': success_count
+            'success': success_count == total_nodes,
+            'command': 'EXECUTE_FORMATION',
+            'moved_nodes': success_count,
+            'total_nodes': total_nodes
         }
-    
+
     async def execute_individual_command(self, target_node: str, command: str) -> Dict:
         """Execute command on specific node"""
         if target_node == self.node_id:
@@ -1173,38 +1257,37 @@ async def run_test_cluster():
             await node.stop()
 
 def print_usage():
-    """Print usage instructions"""
-    print("Raft-Drone Consensus System")
-    print()
-    print("Integration of Raft consensus algorithm with drone swarm control")
-    print("Each Raft node controls one drone for coordinated swarm operations")
-    print()
-    print("Usage:")
-    print("  python raft_drone_node.py <port>        # Run single node on specified port")
-    print("  python raft_drone_node.py --test        # Run full cluster for testing")
-    print()
-    print("Single Node Mode:")
-    print("  Available ports: 8000, 8001, 8002, 8003, 8004")
-    print("  Corresponding drones: 0, 1, 2, 3, 4")
-    print("  Example:")
-    print("    Terminal 1: python raft_drone_node.py 8000  # Controls drone 0")
-    print("    Terminal 2: python raft_drone_node.py 8001  # Controls drone 1")
-    print("    Terminal 3: python raft_drone_node.py 8002  # Controls drone 2")
-    print("    Terminal 4: python raft_drone_node.py 8003  # Controls drone 3")
-    print("    Terminal 5: python raft_drone_node.py 8004  # Controls drone 4")
-    print()
-    print("Drone Connections:")
-    for i, conn in enumerate(DRONE_CONNECTIONS):
-        print(f"  Drone {i}: {conn}")
-    print()
-    print("Swarm Commands (send to leader):")
-    print("  CONNECT_ALL    - Connect all nodes to their drones")
-    print("  ARM_ALL        - Arm all drones")
-    print("  DISARM_ALL     - Disarm all drones")
-    print("  TAKEOFF_ALL    - Take off all drones")
-    print("  LAND_ALL       - Land all drones")
-    print("  SET_FORMATION  - Set swarm formation")
-    print("  GET_SWARM_STATUS - Get status of all drones")
+    """Simplified help text for Raft-Drone Consensus System"""
+    help_text = """
+    Raft-Drone Consensus System
+
+    Integration of Raft consensus algorithm with drone swarm control
+    Each Raft node controls one drone for coordinated swarm operations
+
+    Usage:
+    python raft_drone_node.py <port>        # Run single node on specified port
+    python raft_drone_node.py --test        # Run full cluster for testing
+
+    Single Node Mode:
+    Available ports: 8000, 8001, 8002, 8003, 8004
+    Corresponding drones: 0, 1, 2, 3, 4
+    Example:
+        Terminal 1: python raft_drone_node.py 8000  # Controls drone 0
+        Terminal 2: python raft_drone_node.py 8001  # Controls drone 1
+        Terminal 3: python raft_drone_node.py 8002  # Controls drone 2
+        Terminal 4: python raft_drone_node.py 8003  # Controls drone 3
+        Terminal 5: python raft_drone_node.py 8004  # Controls drone 4
+
+    Swarm Commands (send to leader):
+    CONNECT_ALL    - Connect all nodes to their drones
+    ARM_ALL        - Arm all drones
+    DISARM_ALL     - Disarm all drones
+    TAKEOFF_ALL    - Take off all drones
+    LAND_ALL       - Land all drones
+    SET_FORMATION  - Set swarm formation
+    GET_SWARM_STATUS - Get status of all drones
+    """
+    print(help_text)
 
 async def main():
     """Main function with command line argument parsing"""
