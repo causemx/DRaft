@@ -1105,7 +1105,7 @@ class RaftDroneClient:
 
 async def create_single_raft_drone_node(port: int):
     """Create and start a single Raft-Drone node"""
-    ports = [8000, 8001, 8002, 8003, 8004]
+    ports = [8001, 8002, 8003, 8004, 8005]
     node_ids = ['drone1', 'drone2', 'drone3', 'drone4', 'drone5']
     
     # Create peer list for the entire cluster
@@ -1149,7 +1149,7 @@ async def test_swarm_operations():
     """Test swarm operations"""
     print("\n=== Testing Swarm Operations ===")
     
-    ports = [8000, 8001, 8002, 8003, 8004]
+    ports = [8001, 8002, 8003, 8004, 8005]
     
     # Find leader
     leader_info = await RaftDroneClient.find_leader(ports)
@@ -1178,7 +1178,7 @@ async def test_swarm_operations():
 async def run_single_raft_drone_node(port: int):
     """Run a single Raft-Drone node"""
     print(f"Starting Raft-Drone node on port {port}")
-    print(f"Cluster ports: 8000, 8001, 8002, 8003, 8004")
+    print("Cluster ports: 8001, 8002, 8003, 8004, 8005")
     print(f"Drone connections: {DRONE_CONNECTIONS}")
     
     try:
@@ -1217,7 +1217,7 @@ async def run_test_cluster():
         print("python -c \"")
         print("import asyncio")
         print("from raft_node import RaftDroneClient")
-        print("print(asyncio.run(RaftDroneClient.get_node_status('localhost', 8000)))")
+        print("print(asyncio.run(RaftDroneClient.get_node_status('localhost', 8001)))")
         print("\"")
         print("\nPress Ctrl+C to stop")
         
@@ -1243,14 +1243,14 @@ def print_usage():
     python raft_drone_node.py --test        # Run full cluster for testing
 
     Single Node Mode:
-    Available ports: 8000, 8001, 8002, 8003, 8004
+    Available ports: 8001, 8002, 8003, 8004, 8005
     Corresponding drones: 0, 1, 2, 3, 4
     Example:
-        Terminal 1: python raft_drone_node.py 8000  # Controls drone 0
-        Terminal 2: python raft_drone_node.py 8001  # Controls drone 1
-        Terminal 3: python raft_drone_node.py 8002  # Controls drone 2
-        Terminal 4: python raft_drone_node.py 8003  # Controls drone 3
-        Terminal 5: python raft_drone_node.py 8004  # Controls drone 4
+        Terminal 1: python raft_drone_node.py 8001  # Controls drone 1
+        Terminal 2: python raft_drone_node.py 8002  # Controls drone 2
+        Terminal 3: python raft_drone_node.py 8003  # Controls drone 3
+        Terminal 4: python raft_drone_node.py 8004  # Controls drone 4
+        Terminal 5: python raft_drone_node.py 8005  # Controls drone 5
 
     Swarm Commands (send to leader):
     CONNECT_ALL    - Connect all nodes to their drones
@@ -1280,8 +1280,8 @@ async def main():
     else:
         try:
             port = int(arg)
-            if port not in [8000, 8001, 8002, 8003, 8004]:
-                print(f"Error: Port must be one of: 8000, 8001, 8002, 8003, 8004")
+            if port not in [8001, 8002, 8003, 8004, 8005]:
+                print("Error: Port must be one of: 8001, 8002, 8003, 8004, 8005")
                 print("Use --help for usage information")
                 return
             await run_single_raft_drone_node(port)

@@ -19,7 +19,7 @@ except ImportError:
 
 class SwarmCLI:
     def __init__(self):
-        self.cluster_ports = [8000, 8001, 8002, 8003, 8004]
+        self.cluster_ports = [8001, 8002, 8003, 8004, 8005]
         self.current_leader = None
         self.current_leader_port = None
     
