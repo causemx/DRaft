@@ -234,7 +234,7 @@ class RaftDroneNode:
             )
             if connected:
                 self.drone_connected = True
-                self.logger.success(f"Connected to drone {self.drone_index}")
+                self.logger.info(f"Connected to drone {self.drone_index}")
             else:
                 self.logger.error(f"Failed to connect to drone {self.drone_index}")
         except Exception as e:
@@ -303,7 +303,7 @@ class RaftDroneNode:
                 self.logger.info(f"Applied FLY_TO command to drone {self.drone_index}: {distance}m at {angle}° - {'SUCCESS' if result else 'FAILED'}")
             
             elif cmd_type == "SET_FORMATION_ALL":
-                # NEW WAY - Each node gets only its assigned position
+                # NEW CORRECTED WAY - Each node gets only its assigned position
                 formation_type = data.get('formation_type')
                 assignments = data.get('assignments', {})
                 
@@ -314,7 +314,7 @@ class RaftDroneNode:
                     self.swarm_state['formation_position'] = my_position
                     self.logger.info(f"Set formation position for {self.node_id} (drone {self.drone_index}): {my_position}")
                 else:
-                    self.logger.warning(f"No formation position assigned to {self.node_id}")    
+                    self.logger.warning(f"No formation position assigned to {self.node_id}")
             
             elif cmd_type == "EXECUTE_INDIVIDUAL_FORMATION":
                 # Execute formation movement for this specific node
@@ -452,8 +452,8 @@ class RaftDroneNode:
                 return await self.execute_set_formation(swarm_cmd.parameters)
             
             elif swarm_cmd.command_type == SwarmCommandType.EXECUTE_FORMATION.value:
-                return await self.execute_formation_movement()  # Add this case
-
+                return await self.execute_formation_movement()
+            
             elif swarm_cmd.command_type == SwarmCommandType.GET_SWARM_STATUS.value:
                 return await self.get_swarm_status()
             
@@ -510,8 +510,7 @@ class RaftDroneNode:
         
         # Calculate formation positions
         positions = self.calculate_formation_positions(formation_type, interval, angle)
-        self.logger.debug(f"Calculate result positions: {positions}")
-
+        
         # Create assignments for each node
         formation_assignment = {}
         for i, (node_id, _) in enumerate(self.peers):
@@ -533,8 +532,9 @@ class RaftDroneNode:
             'positions_set': len(formation_assignment) if success else 0
         }
         
+        # If execute immediately is requested, also execute the formation movement
         if execute_immediately and success:
-            await asyncio.sleep(1)
+            await asyncio.sleep(1)  # Small delay to ensure SET_FORMATION is applied
             execute_result = await self.execute_formation_movement()
             result['movement_executed'] = execute_result['success']
             result['moved_nodes'] = execute_result.get('moved_nodes', 0)
@@ -548,33 +548,10 @@ class RaftDroneNode:
         
         # For each node (including self), send fly command based on their formation position
         for i, (node_id, _) in enumerate(self.peers):
-            # Check if this node has a formation position set
-            if node_id == self.node_id:
-                # Handle own movement
-                position = self.swarm_state.get('formation_position')
-                if position:
-                    x, y = position
-                    # Convert cartesian position to distance and angle
-                    import math
-                    distance = math.sqrt(x*x + y*y)
-                    angle = math.degrees(math.atan2(y, x))
-                    
-                    command = f"FLY_TO:{json.dumps({'distance': distance, 'angle': angle})}"
-                    if await self.replicate_command(command):
-                        success_count += 1
-                        self.logger.info(f"Executing formation movement: distance={distance:.1f}m, angle={angle:.1f}°")
-                else:
-                    self.logger.warning(f"No formation position set for {node_id}")
-            else:
-                # For other nodes, we need to send them their specific movement command
-                # This is a simplified approach - in a full implementation, you'd calculate 
-                # each node's position and send individual commands
-                
-                # For now, we'll assume each node will execute based on their stored formation position
-                # when they receive the EXECUTE_FORMATION command via consensus
-                command = f"EXECUTE_INDIVIDUAL_FORMATION:{json.dumps({'node_id': node_id})}"
-                if await self.replicate_command(command):
-                    success_count += 1
+            # Send individual formation execution command to each node
+            command = f"EXECUTE_INDIVIDUAL_FORMATION:{json.dumps({'node_id': node_id})}"
+            if await self.replicate_command(command):
+                success_count += 1
         
         return {
             'success': success_count == total_nodes,
@@ -582,15 +559,6 @@ class RaftDroneNode:
             'moved_nodes': success_count,
             'total_nodes': total_nodes
         }
-
-    async def execute_individual_command(self, target_node: str, command: str) -> Dict:
-        """Execute command on specific node"""
-        if target_node == self.node_id:
-            # Execute locally
-            success = await self.replicate_command(command)
-            return {'success': success, 'target': target_node, 'command': command}
-        else:
-            return {'error': 'Individual commands not implemented for remote nodes'}
     
     def calculate_formation_positions(self, formation_type: str, interval: float, angle: float = 0.0) -> List[Tuple[float, float]]:
         """Calculate formation positions for drones"""
@@ -630,6 +598,15 @@ class RaftDroneNode:
                 positions.append((x_offset, 0))
         
         return positions
+    
+    async def execute_individual_command(self, target_node: str, command: str) -> Dict:
+        """Execute command on specific node"""
+        if target_node == self.node_id:
+            # Execute locally
+            success = await self.replicate_command(command)
+            return {'success': success, 'target': target_node, 'command': command}
+        else:
+            return {'error': 'Individual commands not implemented for remote nodes'}
     
     async def get_swarm_status(self) -> Dict:
         """Get status of entire swarm"""
@@ -732,9 +709,6 @@ class RaftDroneNode:
             self.logger.debug(f"Failed to send append entries to {peer_id}: {e}")
         
         return None
-    
-    # ... (Rest of the Raft implementation methods remain the same as in the original raft_node.py)
-    # Including: send_message_to_peer, election_timer, start_election, etc.
     
     async def send_message_to_peer(self, peer_id: str, peer_port: int, message: Message) -> Optional[Message]:
         """Send message to a peer and wait for response"""
@@ -1191,7 +1165,7 @@ async def test_swarm_operations():
         ('connect_all', {}),
         ('arm_all', {}),
         ('takeoff_all', {'altitude': 10.0}),
-        ('set_formation', {'formation_type': 'circle', 'interval': 20.0, 'angle': 0.0}),
+        ('set_formation', {'formation_type': 'circle', 'interval': 20.0, 'angle': 0.0, 'execute': True}),
         ('get_swarm_status', {}),
     ]
     
@@ -1242,7 +1216,7 @@ async def run_test_cluster():
         print("\nCluster is running. You can test with:")
         print("python -c \"")
         print("import asyncio")
-        print("from raft_drone_node import RaftDroneClient")
+        print("from raft_node import RaftDroneClient")
         print("print(asyncio.run(RaftDroneClient.get_node_status('localhost', 8000)))")
         print("\"")
         print("\nPress Ctrl+C to stop")
