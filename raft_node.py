@@ -2,6 +2,7 @@
 """
 Integrated Raft-Drone Node - Combines Raft consensus with drone control
 Each Raft node controls a specific drone, enabling distributed consensus for swarm operations
+Enhanced with leader-centered formation system
 """
 
 import asyncio
@@ -192,8 +193,10 @@ class RaftDroneNode:
         # Swarm coordination
         self.swarm_state = {
             'formation_type': None,
-            'formation_position': None,
-            'target_position': None
+            'formation_role': None,
+            'target_gps': None,
+            'leader_id': None,
+            'leader_gps': None
         }
         
         self.logger = logging.getLogger(f"RaftDrone-{self.node_id}")
@@ -302,39 +305,195 @@ class RaftDroneNode:
                 result = await loop.run_in_executor(None, self.drone_controller.fly_to_here, distance, angle)
                 self.logger.info(f"Applied FLY_TO command to drone {self.drone_index}: {distance}m at {angle}° - {'SUCCESS' if result else 'FAILED'}")
             
-            elif cmd_type == "SET_FORMATION_ALL":
-                # NEW CORRECTED WAY - Each node gets only its assigned position
-                formation_type = data.get('formation_type')
+            elif cmd_type == "SET_FORMATION_GPS":
+                leader_id = data.get('leader_id')
+                leader_gps = data.get('leader_gps', {})
                 assignments = data.get('assignments', {})
                 
                 # Find this node's assignment
-                my_position = assignments.get(self.node_id)
-                if my_position:
-                    self.swarm_state['formation_type'] = formation_type
-                    self.swarm_state['formation_position'] = my_position
-                    self.logger.info(f"Set formation position for {self.node_id} (drone {self.drone_index}): {my_position}")
-                else:
-                    self.logger.warning(f"No formation position assigned to {self.node_id}")
-            
-            elif cmd_type == "EXECUTE_INDIVIDUAL_FORMATION":
-                # Execute formation movement for this specific node
-                position = self.swarm_state.get('formation_position')
-                if position:
-                    x, y = position
-                    import math
-                    distance = math.sqrt(x*x + y*y)
-                    angle = math.degrees(math.atan2(y, x))
+                my_assignment = assignments.get(self.node_id)
+                if my_assignment:
+                    if my_assignment.get('is_leader'):
+                        self.logger.info(f"Leader {self.node_id} maintains center position at GPS: {leader_gps}")
+                        self.swarm_state['formation_role'] = 'leader_center'
+                    else:
+                        target_lat = my_assignment['lat']
+                        target_lon = my_assignment['lon']
+                        target_alt = my_assignment['alt']
+                        rel_pos = my_assignment['relative_pos']
+                        
+                        self.logger.info(f"Follower {self.node_id} target GPS: {target_lat:.6f}, {target_lon:.6f}")
+                        self.logger.info(f"Relative to leader: {rel_pos[0]:.1f}m East, {rel_pos[1]:.1f}m North")
+                        
+                        self.swarm_state['formation_role'] = 'follower'
                     
-                    result = await loop.run_in_executor(None, self.drone_controller.fly_to_here, distance, angle)
-                    self.logger.info(f"Applied FORMATION FLY_TO command to drone {self.drone_index}: {distance:.1f}m at {angle:.1f}° - {'SUCCESS' if result else 'FAILED'}")
+                    # Store formation data
+                    self.swarm_state['formation_type'] = data.get('formation_type')
+                    self.swarm_state['target_gps'] = my_assignment
+                    self.swarm_state['leader_id'] = leader_id
+                    self.swarm_state['leader_gps'] = leader_gps
                 else:
-                    self.logger.warning(f"No formation position to execute for drone {self.drone_index}")
+                    self.logger.warning(f"No formation assignment for {self.node_id}")
+            
+            elif cmd_type == "EXECUTE_GPS_FORMATION":
+                # Execute movement to GPS formation position
+                target_gps = self.swarm_state.get('target_gps')
+                if target_gps and not target_gps.get('is_leader'):
+                    # Only followers move, leader stays in place
+                    target_lat = target_gps['lat']
+                    target_lon = target_gps['lon']
+                    target_alt = target_gps['alt']
+                    
+                    # Get current position
+                    current_status = self.get_drone_status()
+                    current_pos = current_status.get('position')
+                    
+                    if current_pos:
+                        current_lat, current_lon = current_pos
+                        
+                        # Calculate distance and bearing to target
+                        distance, bearing = self.calculate_distance_bearing(
+                            current_lat, current_lon, target_lat, target_lon
+                        )
+                        
+                        self.logger.info(f"Moving to formation: {distance:.1f}m at {bearing:.1f}°")
+                        
+                        # Execute movement
+                        result = await loop.run_in_executor(
+                            None, self.drone_controller.fly_to_here, distance, bearing
+                        )
+                        
+                        success_msg = "SUCCESS" if result else "FAILED"
+                        self.logger.info(f"GPS formation movement: {success_msg}")
+                    else:
+                        self.logger.error("Current GPS position not available")
+                else:
+                    self.logger.info(f"Leader {self.node_id} remains at center position")
             
             else:
                 self.logger.warning(f"Unknown command type: {cmd_type}")
         
         except Exception as e:
             self.logger.error(f"Error applying command '{command}': {e}")
+
+    def calculate_distance_bearing(self, lat1: float, lon1: float, lat2: float, lon2: float) -> Tuple[float, float]:
+        """
+        Calculate distance and bearing between two GPS points
+        
+        Returns:
+            (distance_meters, bearing_degrees): Distance and bearing to target
+        """
+        import math
+        
+        # Convert to radians
+        lat1_rad = math.radians(lat1)
+        lat2_rad = math.radians(lat2)
+        delta_lat = math.radians(lat2 - lat1)
+        delta_lon = math.radians(lon2 - lon1)
+        
+        # Calculate distance using Haversine formula
+        a = (math.sin(delta_lat/2)**2 + 
+             math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon/2)**2)
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        distance = 6378137.0 * c  # Earth radius in meters
+        
+        # Calculate bearing
+        y = math.sin(delta_lon) * math.cos(lat2_rad)
+        x = (math.cos(lat1_rad) * math.sin(lat2_rad) - 
+             math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(delta_lon))
+        bearing = math.atan2(y, x)
+        bearing = math.degrees(bearing)
+        bearing = (bearing + 360) % 360  # Normalize to 0-360
+        
+        return distance, bearing
+
+    def relative_to_gps(self, base_lat: float, base_lon: float, rel_x: float, rel_y: float) -> Tuple[float, float]:
+        """
+        Convert relative X,Y position (meters) to GPS coordinates
+        
+        Args:
+            base_lat, base_lon: Base GPS position (leader's position)
+            rel_x, rel_y: Relative position in meters (X=East, Y=North)
+        
+        Returns:
+            (target_lat, target_lon): Target GPS coordinates
+        """
+        import math
+        
+        # Earth radius in meters
+        earth_radius = 6378137.0
+        
+        # Convert relative position to lat/lon offset
+        lat_offset = rel_y / earth_radius * (180.0 / math.pi)
+        lon_offset = rel_x / (earth_radius * math.cos(math.radians(base_lat))) * (180.0 / math.pi)
+        
+        target_lat = base_lat + lat_offset
+        target_lon = base_lon + lon_offset
+        
+        return target_lat, target_lon
+
+    def calculate_formation_positions_leader_centered(self, formation_type: str, interval: float, angle: float = 0.0) -> List[Tuple[float, float]]:
+        """
+        Calculate formation positions with LEADER AT CENTER
+        Returns relative positions for all drones (leader gets (0,0))
+        
+        Args:
+            formation_type: Only 'line' is supported
+            interval: Distance between adjacent drones in meters
+            angle: Rotation angle of the entire line in degrees
+        
+        Returns:
+            List of (x, y) relative positions for each drone
+            Leader position is always (0, 0)
+        """
+        import math
+        
+        num_drones = len(self.peers)
+        positions = []
+        
+        # Only support line formation
+        if formation_type.lower() != 'line':
+            self.logger.warning(f"Unsupported formation type: {formation_type}. Using line formation.")
+        
+        # Find leader index in peers list
+        leader_index = None
+        for i, (node_id, _) in enumerate(self.peers):
+            if node_id == self.node_id:
+                leader_index = i
+                break
+        
+        if leader_index is None:
+            self.logger.error("Leader not found in peers list!")
+            return []
+        
+        # Calculate line formation with leader at center
+        for i in range(num_drones):
+            if i == leader_index:
+                # Leader stays at center (0, 0)
+                x, y = 0.0, 0.0
+            else:
+                # Calculate relative position for this drone
+                # Position index relative to leader
+                relative_index = i - leader_index
+                
+                # Position along the line
+                x_offset = relative_index * interval
+                y_offset = 0.0
+                
+                # Apply rotation transformation
+                angle_rad = math.radians(angle)
+                x = x_offset * math.cos(angle_rad) - y_offset * math.sin(angle_rad)
+                y = x_offset * math.sin(angle_rad) + y_offset * math.cos(angle_rad)
+            
+            positions.append((x, y))
+            node_id = self.peers[i][0]
+            
+            if i == leader_index:
+                self.logger.info(f"Leader {node_id}: CENTER position (0.0, 0.0)")
+            else:
+                self.logger.info(f"Follower {node_id}: relative position ({x:.1f}, {y:.1f})")
+        
+        return positions
     
     async def handle_client_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle incoming client connections"""
@@ -502,24 +661,65 @@ class RaftDroneNode:
         return {'success': success, 'command': 'LAND_ALL'}
     
     async def execute_set_formation(self, parameters: Dict) -> Dict:
-        """Set formation for the swarm - CORRECTED VERSION"""
+        """
+        Set formation for the swarm - LEADER-CENTERED VERSION
+        Leader stays at current position, others move relative to leader's GPS coordinates
+        """
         formation_type = parameters.get('formation_type')
         interval = parameters.get('interval', 10.0)
         angle = parameters.get('angle', 0.0)
         execute_immediately = parameters.get('execute', False)
         
-        # Calculate formation positions
-        positions = self.calculate_formation_positions(formation_type, interval, angle)
+        # Get leader's current GPS position
+        leader_status = self.get_drone_status()
+        leader_position = leader_status.get('position')
         
-        # Create assignments for each node
+        if not leader_position:
+            return {'error': 'Leader GPS position not available', 'leader_id': self.node_id}
+        
+        leader_lat, leader_lon = leader_position
+        leader_alt = leader_status.get('altitude', 0)
+        
+        self.logger.info(f"Leader {self.node_id} GPS: {leader_lat:.6f}, {leader_lon:.6f}, {leader_alt:.1f}m")
+        
+        # Calculate formation positions relative to leader
+        relative_positions = self.calculate_formation_positions_leader_centered(
+            formation_type, interval, angle
+        )
+        
+        # Convert relative positions to GPS coordinates
         formation_assignment = {}
-        for i, (node_id, _) in enumerate(self.peers):
-            if i < len(positions):
-                formation_assignment[node_id] = positions[i]
         
-        # Send SINGLE command with ALL assignments
-        command = f"SET_FORMATION_ALL:{json.dumps({
-            'formation_type': formation_type, 
+        for i, (node_id, _) in enumerate(self.peers):
+            if node_id == self.node_id:
+                # Leader stays at current position
+                formation_assignment[node_id] = {
+                    'type': 'leader_center',
+                    'lat': leader_lat,
+                    'lon': leader_lon,
+                    'alt': leader_alt,
+                    'relative_pos': (0.0, 0.0),
+                    'is_leader': True
+                }
+            elif i < len(relative_positions):
+                # Calculate GPS coordinates for follower drones
+                rel_x, rel_y = relative_positions[i]
+                target_lat, target_lon = self.relative_to_gps(leader_lat, leader_lon, rel_x, rel_y)
+                
+                formation_assignment[node_id] = {
+                    'type': 'follower_relative',
+                    'lat': target_lat,
+                    'lon': target_lon,
+                    'alt': leader_alt,  # Same altitude as leader
+                    'relative_pos': (rel_x, rel_y),
+                    'is_leader': False
+                }
+        
+        # Send formation command with GPS coordinates
+        command = f"SET_FORMATION_GPS:{json.dumps({
+            'formation_type': formation_type,
+            'leader_id': self.node_id,
+            'leader_gps': {'lat': leader_lat, 'lon': leader_lon, 'alt': leader_alt},
             'assignments': formation_assignment
         })}"
         
@@ -527,77 +727,44 @@ class RaftDroneNode:
         
         result = {
             'success': success,
-            'command': 'SET_FORMATION',
+            'command': 'SET_FORMATION_GPS',
             'formation_type': formation_type,
-            'positions_set': len(formation_assignment) if success else 0
+            'leader_id': self.node_id,
+            'leader_position': {'lat': leader_lat, 'lon': leader_lon, 'alt': leader_alt},
+            'positions_set': len(formation_assignment) if success else 0,
+            'interval': interval,
+            'angle': angle
         }
         
-        # If execute immediately is requested, also execute the formation movement
+        # If execute immediately is requested
         if execute_immediately and success:
             await asyncio.sleep(1)  # Small delay to ensure SET_FORMATION is applied
-            execute_result = await self.execute_formation_movement()
+            execute_result = await self.execute_formation_movement_gps()
             result['movement_executed'] = execute_result['success']
             result['moved_nodes'] = execute_result.get('moved_nodes', 0)
         
         return result
-    
-    async def execute_formation_movement(self) -> Dict:
-        """Execute movement to formation positions"""
+
+    async def execute_formation_movement_gps(self) -> Dict:
+        """Execute GPS-based formation movement"""
         success_count = 0
         total_nodes = len(self.peers)
         
-        # For each node (including self), send fly command based on their formation position
-        for i, (node_id, _) in enumerate(self.peers):
-            # Send individual formation execution command to each node
-            command = f"EXECUTE_INDIVIDUAL_FORMATION:{json.dumps({'node_id': node_id})}"
-            if await self.replicate_command(command):
-                success_count += 1
+        # Send formation execution command
+        command = f"EXECUTE_GPS_FORMATION:{json.dumps({})}"
+        if await self.replicate_command(command):
+            success_count = total_nodes  # Assume success for all nodes
         
         return {
             'success': success_count == total_nodes,
-            'command': 'EXECUTE_FORMATION',
+            'command': 'EXECUTE_GPS_FORMATION',
             'moved_nodes': success_count,
             'total_nodes': total_nodes
         }
     
-    def calculate_formation_positions(self, formation_type: str, interval: float, angle: float = 0.0) -> List[Tuple[float, float]]:
-        """Calculate formation positions for drones"""
-        import math
-        
-        num_drones = len(self.peers)
-        positions = []
-        
-        if formation_type.lower() == 'line':
-            for i in range(num_drones):
-                x_offset = (i - (num_drones - 1) / 2) * interval
-                y_offset = 0
-                x = x_offset * math.cos(math.radians(angle)) - y_offset * math.sin(math.radians(angle))
-                y = x_offset * math.sin(math.radians(angle)) + y_offset * math.cos(math.radians(angle))
-                positions.append((x, y))
-        
-        elif formation_type.lower() == 'circle':
-            angle_step = 360.0 / num_drones
-            for i in range(num_drones):
-                drone_angle = math.radians(i * angle_step + angle)
-                x = interval * math.cos(drone_angle)
-                y = interval * math.sin(drone_angle)
-                positions.append((x, y))
-        
-        elif formation_type.lower() == 'triangle' and num_drones >= 3:
-            angles = [0, 120, 240, 60, 180]  # Support up to 5 drones
-            for i in range(min(num_drones, 5)):
-                drone_angle = math.radians(angles[i] + angle)
-                x = interval * math.cos(drone_angle)
-                y = interval * math.sin(drone_angle)
-                positions.append((x, y))
-        
-        else:
-            # Default to line formation
-            for i in range(num_drones):
-                x_offset = (i - (num_drones - 1) / 2) * interval
-                positions.append((x_offset, 0))
-        
-        return positions
+    async def execute_formation_movement(self) -> Dict:
+        """Execute movement to formation positions"""
+        return await self.execute_formation_movement_gps()
     
     async def execute_individual_command(self, target_node: str, command: str) -> Dict:
         """Execute command on specific node"""
@@ -624,7 +791,6 @@ class RaftDroneNode:
             'formation_state': self.swarm_state
         }
         
-        # TODO: Collect status from other nodes
         return swarm_status
     
     def get_drone_status(self) -> Dict:
@@ -1125,169 +1291,30 @@ async def create_single_raft_drone_node(port: int):
     
     return node
 
-async def create_raft_drone_cluster():
-    """Create and start a 5-node Raft-Drone cluster"""
-    nodes = []
-    ports = [8000, 8001, 8002, 8003, 8004]
-    node_ids = ['drone1', 'drone2', 'drone3', 'drone4', 'drone5']
-    
-    # Create peer list
-    peers = [(node_id, port) for node_id, port in zip(node_ids, ports)]
-    
-    # Create nodes
-    for i, (node_id, port) in enumerate(zip(node_ids, ports)):
-        node = RaftDroneNode(node_id, port, i, peers)
-        nodes.append(node)
-    
-    # Start all nodes
-    start_tasks = [node.start() for node in nodes]
-    await asyncio.gather(*start_tasks)
-    
-    return nodes
-
-async def test_swarm_operations():
-    """Test swarm operations"""
-    print("\n=== Testing Swarm Operations ===")
-    
-    ports = [8001, 8002, 8003, 8004, 8005]
-    
-    # Find leader
-    leader_info = await RaftDroneClient.find_leader(ports)
-    if not leader_info:
-        print("No leader found!")
-        return
-    
-    leader_id, leader_port = leader_info
-    print(f"Found leader: {leader_id} on port {leader_port}")
-    
-    # Test swarm commands
-    commands = [
-        ('connect_all', {}),
-        ('arm_all', {}),
-        ('takeoff_all', {'altitude': 10.0}),
-        ('set_formation', {'formation_type': 'circle', 'interval': 20.0, 'angle': 0.0, 'execute': True}),
-        ('get_swarm_status', {}),
-    ]
-    
-    for cmd_type, params in commands:
-        print(f"\nExecuting: {cmd_type}")
-        result = await RaftDroneClient.send_swarm_command('localhost', leader_port, cmd_type, params)
-        print(f"Result: {result}")
-        await asyncio.sleep(2)  # Wait between commands
-
-async def run_single_raft_drone_node(port: int):
-    """Run a single Raft-Drone node"""
-    print(f"Starting Raft-Drone node on port {port}")
-    print("Cluster ports: 8001, 8002, 8003, 8004, 8005")
-    print(f"Drone connections: {DRONE_CONNECTIONS}")
-    
-    try:
-        node = await create_single_raft_drone_node(port)
-        print(f"Node {node.node_id} is running on port {port}")
-        print(f"Controlling drone {node.drone_index} ({DRONE_CONNECTIONS[node.drone_index]})")
-        print("Waiting for other nodes to join the cluster...")
-        print("Press Ctrl+C to stop this node")
-        
-        # Keep running
-        while True:
-            await asyncio.sleep(1)
-            
-    except KeyboardInterrupt:
-        print(f"\nShutting down node on port {port}...")
-        await node.stop()
-    except Exception as e:
-        print(f"Error: {e}")
-
-async def run_test_cluster():
-    """Run full cluster for testing"""
-    print("Starting 5-node Raft-Drone cluster...")
-    print(f"Drone connections: {DRONE_CONNECTIONS}")
-    
-    nodes = await create_raft_drone_cluster()
-    
-    try:
-        # Wait for leader election
-        print("Waiting for leader election...")
-        await asyncio.sleep(5)
-        
-        # Test swarm operations
-        await test_swarm_operations()
-        
-        print("\nCluster is running. You can test with:")
-        print("python -c \"")
-        print("import asyncio")
-        print("from raft_node import RaftDroneClient")
-        print("print(asyncio.run(RaftDroneClient.get_node_status('localhost', 8001)))")
-        print("\"")
-        print("\nPress Ctrl+C to stop")
-        
-        # Keep running
-        while True:
-            await asyncio.sleep(1)
-            
-    except KeyboardInterrupt:
-        print("\nShutting down cluster...")
-        for node in nodes:
-            await node.stop()
-
-def print_usage():
-    """Simplified help text for Raft-Drone Consensus System"""
-    help_text = """
-    Raft-Drone Consensus System
-
-    Integration of Raft consensus algorithm with drone swarm control
-    Each Raft node controls one drone for coordinated swarm operations
-
-    Usage:
-    python raft_drone_node.py <port>        # Run single node on specified port
-    python raft_drone_node.py --test        # Run full cluster for testing
-
-    Single Node Mode:
-    Available ports: 8001, 8002, 8003, 8004, 8005
-    Corresponding drones: 0, 1, 2, 3, 4
-    Example:
-        Terminal 1: python raft_drone_node.py 8001  # Controls drone 1
-        Terminal 2: python raft_drone_node.py 8002  # Controls drone 2
-        Terminal 3: python raft_drone_node.py 8003  # Controls drone 3
-        Terminal 4: python raft_drone_node.py 8004  # Controls drone 4
-        Terminal 5: python raft_drone_node.py 8005  # Controls drone 5
-
-    Swarm Commands (send to leader):
-    CONNECT_ALL    - Connect all nodes to their drones
-    ARM_ALL        - Arm all drones
-    DISARM_ALL     - Disarm all drones
-    TAKEOFF_ALL    - Take off all drones
-    LAND_ALL       - Land all drones
-    SET_FORMATION  - Set swarm formation
-    GET_SWARM_STATUS - Get status of all drones
-    """
-    print(help_text)
-
 async def main():
     """Main function with command line argument parsing"""
     import sys
     
     if len(sys.argv) == 1:
-        print_usage()
+        print("Usage: python raft_node.py <port>")
+        print("Available ports: 8001, 8002, 8003, 8004, 8005")
         return
     
-    arg = sys.argv[1]
-    
-    if arg == "--test":
-        await run_test_cluster()
-    elif arg == "--help" or arg == "-h":
-        print_usage()
-    else:
-        try:
-            port = int(arg)
-            if port not in [8001, 8002, 8003, 8004, 8005]:
-                print("Error: Port must be one of: 8001, 8002, 8003, 8004, 8005")
-                print("Use --help for usage information")
-                return
-            await run_single_raft_drone_node(port)
-        except ValueError:
-            print(f"Error: Invalid port '{arg}'. Must be a number.")
-            print("Use --help for usage information")
+    try:
+        port = int(sys.argv[1])
+        if port not in [8001, 8002, 8003, 8004, 8005]:
+            print("Error: Port must be one of: 8001, 8002, 8003, 8004, 8005")
+            return
+        await create_single_raft_drone_node(port)
+        
+        # Keep running
+        while True:
+            await asyncio.sleep(1)
+            
+    except ValueError:
+        print(f"Error: Invalid port '{sys.argv[1]}'. Must be a number.")
+    except KeyboardInterrupt:
+        print("\nShutting down...")
 
 if __name__ == "__main__":
     asyncio.run(main())
