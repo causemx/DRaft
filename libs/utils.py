@@ -396,6 +396,74 @@ class DroneController:
             logger.warning("No acknowledgment received for takeoff attempt")
 
 
+    def fly_to_target(self, target_lat, target_lon, altitude) -> bool:
+        try:
+            t_lat_int = int(target_lat * 1e7)
+            t_lon_int = int(target_lon * 1e7)
+        except (ValueError, OverflowError) as e:
+            logger.error(f"Failed to convert coordinates to MAVLink format: {e}")
+            return False
+        
+        # Get current timestamp for the message
+        time_boot_ms = int(time.time() * 1000) % (2**32)  # Ensure it fits in uint32
+        
+        # Define which fields to use in the SET_POSITION_TARGET_GLOBAL_INT message
+        # We're only setting position (lat, lon, alt)
+        mask = (
+            dialect.POSITION_TARGET_TYPEMASK_VX_IGNORE |
+            dialect.POSITION_TARGET_TYPEMASK_VY_IGNORE |
+            dialect.POSITION_TARGET_TYPEMASK_VZ_IGNORE |
+            dialect.POSITION_TARGET_TYPEMASK_AX_IGNORE |
+            dialect.POSITION_TARGET_TYPEMASK_AY_IGNORE |
+            dialect.POSITION_TARGET_TYPEMASK_AZ_IGNORE |
+            dialect.POSITION_TARGET_TYPEMASK_FORCE_SET |
+            dialect.POSITION_TARGET_TYPEMASK_YAW_IGNORE |
+            dialect.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+        )
+        
+        # Create SET_POSITION_TARGET_GLOBAL_INT message
+        position_target_msg = dialect.MAVLink_set_position_target_global_int_message(
+            time_boot_ms=time_boot_ms,                             # Not used
+            target_system=self.drone.target_system,
+            target_component=self.drone.target_component,
+            coordinate_frame=dialect.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,  # Altitude relative to home
+            type_mask=mask,                             # Use only the position values
+            lat_int=t_lat_int,                            # Latitude (degrees * 1e7)
+            lon_int=t_lon_int,                            # Longitude (degrees * 1e7)
+            alt=altitude,                                    # Altitude (meters, relative to home)
+            vx=0,                                       # X velocity (not used)
+            vy=0,                                       # Y velocity (not used)
+            vz=0,                                       # Z velocity (not used)
+            afx=0,                                      # X acceleration (not used)
+            afy=0,                                      # Y acceleration (not used)
+            afz=0,                                      # Z acceleration (not used)
+            yaw=0,                                      # Yaw (not used)
+            yaw_rate=0                                  # Yaw rate (not used)
+        )
+
+        # Send the position target message
+        self.drone.mav.send(position_target_msg)
+        logger.info("Start position target command attempt")
+        
+        # Unlike mission commands, SET_POSITION_TARGET_GLOBAL_INT typically doesn't get a direct ACK
+        # We'll use a brief delay and check if mode is still GUIDED as a basic validation
+        time.sleep(0.5)
+        
+        # Check if still in GUIDED mode
+        current_mode = self.get_current_mode()
+        if current_mode == FlightMode.GUIDED:
+            logger.success("Position target command sent in GUIDED mode!")
+            success = True
+        else:
+            logger.warning(f"Not in GUIDED mode after sending command, mode is {current_mode}") 
+        
+        if success:
+            logger.success("Successfully sent position target command to flyto {target_lat}, {target_lon}")
+        else:
+            logger.error("Failed to send position target command after attempts")
+        
+        return success
+
     def fly_to_here(self, distance=5.0, angle=0.0, max_retries=3):
         """
         Command the drone to fly to a location in a specific direction using SET_POSITION_TARGET_GLOBAL_INT

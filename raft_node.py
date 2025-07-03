@@ -11,11 +11,11 @@ import random
 import time
 import logging
 import struct
-import threading
 from enum import Enum
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple, Any
 from libs.utils import DroneController, FlightMode
+from libs.cal import Calculator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -352,7 +352,7 @@ class RaftDroneNode:
                         current_lat, current_lon = current_pos
                         
                         # Calculate distance and bearing to target
-                        distance, bearing = self.calculate_distance_bearing(
+                        distance, bearing = Calculator.calculate_distance_bearing(
                             current_lat, current_lon, target_lat, target_lon
                         )
                         
@@ -360,7 +360,7 @@ class RaftDroneNode:
                         
                         # Execute movement
                         result = await loop.run_in_executor(
-                            None, self.drone_controller.fly_to_here, distance, bearing
+                            None, self.drone_controller.fly_to_target, target_lat, target_lon, target_alt
                         )
                         
                         success_msg = "SUCCESS" if result else "FAILED"
@@ -376,62 +376,7 @@ class RaftDroneNode:
         except Exception as e:
             self.logger.error(f"Error applying command '{command}': {e}")
 
-    def calculate_distance_bearing(self, lat1: float, lon1: float, lat2: float, lon2: float) -> Tuple[float, float]:
-        """
-        Calculate distance and bearing between two GPS points
-        
-        Returns:
-            (distance_meters, bearing_degrees): Distance and bearing to target
-        """
-        import math
-        
-        # Convert to radians
-        lat1_rad = math.radians(lat1)
-        lat2_rad = math.radians(lat2)
-        delta_lat = math.radians(lat2 - lat1)
-        delta_lon = math.radians(lon2 - lon1)
-        
-        # Calculate distance using Haversine formula
-        a = (math.sin(delta_lat/2)**2 + 
-             math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon/2)**2)
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-        distance = 6378137.0 * c  # Earth radius in meters
-        
-        # Calculate bearing
-        y = math.sin(delta_lon) * math.cos(lat2_rad)
-        x = (math.cos(lat1_rad) * math.sin(lat2_rad) - 
-             math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(delta_lon))
-        bearing = math.atan2(y, x)
-        bearing = math.degrees(bearing)
-        bearing = (bearing + 360) % 360  # Normalize to 0-360
-        
-        return distance, bearing
-
-    def relative_to_gps(self, base_lat: float, base_lon: float, rel_x: float, rel_y: float) -> Tuple[float, float]:
-        """
-        Convert relative X,Y position (meters) to GPS coordinates
-        
-        Args:
-            base_lat, base_lon: Base GPS position (leader's position)
-            rel_x, rel_y: Relative position in meters (X=East, Y=North)
-        
-        Returns:
-            (target_lat, target_lon): Target GPS coordinates
-        """
-        import math
-        
-        # Earth radius in meters
-        earth_radius = 6378137.0
-        
-        # Convert relative position to lat/lon offset
-        lat_offset = rel_y / earth_radius * (180.0 / math.pi)
-        lon_offset = rel_x / (earth_radius * math.cos(math.radians(base_lat))) * (180.0 / math.pi)
-        
-        target_lat = base_lat + lat_offset
-        target_lon = base_lon + lon_offset
-        
-        return target_lat, target_lon
-
+    
     def calculate_formation_positions_leader_centered(self, formation_type: str, interval: float, angle: float = 0.0) -> List[Tuple[float, float]]:
         """
         Calculate formation positions with LEADER AT CENTER
@@ -494,7 +439,7 @@ class RaftDroneNode:
                 self.logger.info(f"Follower {node_id}: relative position ({x:.1f}, {y:.1f})")
         
         return positions
-    
+
     async def handle_client_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle incoming client connections"""
         client_addr = writer.get_extra_info('peername')
@@ -704,7 +649,7 @@ class RaftDroneNode:
             elif i < len(relative_positions):
                 # Calculate GPS coordinates for follower drones
                 rel_x, rel_y = relative_positions[i]
-                target_lat, target_lon = self.relative_to_gps(leader_lat, leader_lon, rel_x, rel_y)
+                target_lat, target_lon = Calculator.relative_to_gps(leader_lat, leader_lon, rel_x, rel_y)
                 
                 formation_assignment[node_id] = {
                     'type': 'follower_relative',
@@ -1282,6 +1227,7 @@ async def create_single_raft_drone_node(port: int):
         port_index = ports.index(port)
         node_id = node_ids[port_index]
         drone_index = port_index
+        print(f"Create single raft node, port_index: {port_index}, node_id: {node_id}, drone_inex: {drone_index}")
     except ValueError:
         raise ValueError(f"Port {port} not in allowed ports: {ports}")
     
