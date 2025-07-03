@@ -7,22 +7,27 @@ Enhanced with leader-centered formation system
 import asyncio
 import click
 import json
-import time
 from typing import Optional, Dict, List, Tuple
 
-# Import from raft_node.py
+# Import from raft_node.py and config_manager.py
 try:
     from raft_node import RaftDroneClient, SwarmCommandType, SocketProtocol, Message, MessageType
+    from config_manager import get_config_manager
 except ImportError:
-    print("Error: Cannot import from raft_node.py")
-    print("Make sure raft_node.py is in the same directory and contains RaftDroneClient")
+    print("Error: Cannot import required modules")
+    print("Make sure raft_node.py and config_manager.py are in the same directory")
     exit(1)
 
 class SwarmCLI:
     def __init__(self):
-        self.cluster_ports = [8001, 8002, 8003, 8004, 8005]
+        # Load configuration
+        self.config_manager = get_config_manager()
+        self.cluster_ports = self.config_manager.get_all_ports()
         self.current_leader = None
         self.current_leader_port = None
+        
+        print(f"Loaded cluster configuration: {self.config_manager.get_drone_count()} nodes")
+        print(f"Cluster ports: {self.cluster_ports}")
     
     async def find_leader(self) -> bool:
         """Find the current leader in the cluster"""
@@ -79,8 +84,29 @@ def cli():
     Control a distributed drone swarm using Raft consensus algorithm.
     Each drone is controlled by a Raft node for fault-tolerant coordination.
     Leader-centered formation keeps the leader at formation center.
+    
+    Configuration is loaded from config.ini file.
     """
     pass
+
+@cli.command()
+async def config():
+    """Show current configuration"""
+    click.echo("Current Configuration:")
+    click.echo("=" * 50)
+    
+    try:
+        all_nodes = swarm_cli.config_manager.get_all_nodes()
+        click.echo(f"{'Node ID':<10} {'Port':<6} {'Drone Connection':<25}")
+        click.echo("-" * 50)
+        
+        for node_id, port, connection in all_nodes:
+            click.echo(f"{node_id:<10} {port:<6} {connection:<25}")
+        
+        click.echo(f"\nTotal nodes: {len(all_nodes)}")
+        
+    except Exception as e:
+        click.echo(f"Error reading configuration: {e}")
 
 @cli.command()
 async def status():
@@ -122,10 +148,15 @@ async def status():
                 alt = drone_status.get('altitude', 0)
                 click.echo(f"         Drone: {armed} | Mode: {mode} | Alt: {alt:.1f}m")
         else:
-            click.echo(f"         Node{port-7999:<4} | Port {port} | OFFLINE   | ---   | ---")
+            # Get node ID from port using config
+            try:
+                node_id = swarm_cli.config_manager.get_node_id_by_port(port)
+                click.echo(f"         {node_id:<8} | Port {port} | OFFLINE   | ---   | ---")
+            except:
+                click.echo(f"         Node{port}    | Port {port} | OFFLINE   | ---   | ---")
     
     click.echo("="*80)
-    click.echo(f"Cluster: {online_nodes}/5 nodes online")
+    click.echo(f"Cluster: {online_nodes}/{len(swarm_cli.cluster_ports)} nodes online")
     if leader_node:
         click.echo(f"Leader: {leader_node}")
     else:
@@ -231,7 +262,7 @@ async def formation(interval, angle, execute):
     current GPS position. All other drones calculate target positions 
     relative to the leader's GPS coordinates.
     
-    Formation Layout (5 drones, leader is drone3):
+    Formation Layout (leader at center):
     drone1 ---- drone2 ---- LEADER ---- drone4 ---- drone5
                            (CENTER)
     
@@ -386,7 +417,11 @@ async def formation_status():
                     click.echo(f"     Target: {target_lat:.6f}, {target_lon:.6f}")
                     click.echo(f"     Relative: {rel_pos[0]:+.1f}m East, {rel_pos[1]:+.1f}m North")
         else:
-            click.echo(f"OFFLINE  Node{port-7999:<4} | Port {port} | Status: Disconnected")
+            try:
+                node_id = swarm_cli.config_manager.get_node_id_by_port(port)
+                click.echo(f"OFFLINE  {node_id:<8} | Port {port} | Status: Disconnected")
+            except:
+                click.echo(f"OFFLINE  Node{port}    | Port {port} | Status: Disconnected")
     
     click.echo("="*90)
     if leader_found:
@@ -438,13 +473,15 @@ async def preview_gps(interval, angle):
     
     # Calculate positions for all nodes
     import math
-    node_names = ['drone1', 'drone2', 'drone3', 'drone4', 'drone5']
+    
+    # Get all nodes from config
+    all_nodes = swarm_cli.config_manager.get_all_nodes()
     leader_id = leader_status['node_id']
     
     # Find leader index
     leader_index = None
-    for i, name in enumerate(node_names):
-        if name == leader_id:
+    for i, (node_id, _, _) in enumerate(all_nodes):
+        if node_id == leader_id:
             leader_index = i
             break
     
@@ -452,7 +489,7 @@ async def preview_gps(interval, angle):
         click.echo("ERROR: Cannot determine leader index")
         return
     
-    for i, node_name in enumerate(node_names):
+    for i, (node_name, _, _) in enumerate(all_nodes):
         if i == leader_index:
             # Leader stays at center
             click.echo(f"{node_name:<8} │ CENTER   │ {leader_lat:>12.6f} │ {leader_lon:>12.6f} │ (  0.0,   0.0) [LEADER]")
@@ -864,6 +901,11 @@ GPS CALCULATION:
 • Uses Earth geometry for accurate positioning
 • Accounts for latitude variation in longitude calculations
 • Maintains formation integrity across different geographic locations
+
+CONFIGURATION:
+• Drone connections and ports are loaded from config.ini
+• Each drone has its own connection string and node port
+• Configuration can be viewed with 'config' command
     """
     click.echo(help_text)
 

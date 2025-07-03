@@ -16,18 +16,13 @@ from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple, Any
 from libs.utils import DroneController, FlightMode
 from libs.cal import Calculator
+from config_manager import get_config_manager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# Drone connection strings for SITL instances
-DRONE_CONNECTIONS = [
-    "udp:172.21.128.1:14550",  # Drone 0
-    "udp:172.21.128.1:14560",  # Drone 1
-    "udp:172.21.128.1:14570",  # Drone 2
-    "udp:172.21.128.1:14580",  # Drone 3
-    "udp:172.21.128.1:14590"   # Drone 4
-]
+# Global configuration manager
+config_manager = get_config_manager()
 
 class NodeState(Enum):
     FOLLOWER = "follower"
@@ -159,8 +154,9 @@ class RaftDroneNode:
         self.drone_index = drone_index
         self.peers = peers  # List of (node_id, port) tuples
         
-        # Drone controller
-        self.drone_controller = DroneController(DRONE_CONNECTIONS[drone_index])
+        # Get drone connection string from config
+        drone_connection = config_manager.get_drone_connection(drone_index)
+        self.drone_controller = DroneController(drone_connection)
         self.drone_connected = False
         
         # Persistent state
@@ -1216,26 +1212,33 @@ class RaftDroneClient:
 
 async def create_single_raft_drone_node(port: int):
     """Create and start a single Raft-Drone node"""
-    ports = [8001, 8002, 8003, 8004, 8005]
-    node_ids = ['drone1', 'drone2', 'drone3', 'drone4', 'drone5']
-    
-    # Create peer list for the entire cluster
-    peers = [(node_id, p) for node_id, p in zip(node_ids, ports)]
-    
-    # Find the node_id and drone_index for this port
     try:
-        port_index = ports.index(port)
-        node_id = node_ids[port_index]
-        drone_index = port_index
-        print(f"Create single raft node, port_index: {port_index}, node_id: {node_id}, drone_inex: {drone_index}")
-    except ValueError:
-        raise ValueError(f"Port {port} not in allowed ports: {ports}")
-    
-    # Create and start the node
-    node = RaftDroneNode(node_id, port, drone_index, peers)
-    await node.start()
-    
-    return node
+        # Get configuration from config manager
+        all_nodes = config_manager.get_all_nodes()
+        all_ports = config_manager.get_all_ports()
+        
+        if port not in all_ports:
+            raise ValueError(f"Port {port} not found in configuration. Available ports: {all_ports}")
+        
+        # Get node information
+        drone_index = config_manager.get_drone_index_by_port(port)
+        node_id = config_manager.get_node_id_by_port(port)
+        
+        # Create peer list (node_id, port)
+        peers = [(node_id, node_port) for node_id, node_port, _ in all_nodes]
+        
+        print(f"Creating node {node_id} (drone{drone_index}) on port {port}")
+        print(f"Peers: {peers}")
+        
+        # Create and start the node
+        node = RaftDroneNode(node_id, port, drone_index, peers)
+        await node.start()
+        
+        return node
+        
+    except Exception as e:
+        print(f"Error creating node: {e}")
+        raise
 
 async def main():
     """Main function with command line argument parsing"""
@@ -1243,24 +1246,27 @@ async def main():
     
     if len(sys.argv) == 1:
         print("Usage: python raft_node.py <port>")
-        print("Available ports: 8001, 8002, 8003, 8004, 8005")
+        try:
+            available_ports = config_manager.get_all_ports()
+            print(f"Available ports: {available_ports}")
+        except Exception as e:
+            print(f"Error reading configuration: {e}")
         return
     
     try:
         port = int(sys.argv[1])
-        if port not in [8001, 8002, 8003, 8004, 8005]:
-            print("Error: Port must be one of: 8001, 8002, 8003, 8004, 8005")
-            return
-        await create_single_raft_drone_node(port)
+        node = await create_single_raft_drone_node(port)
         
         # Keep running
         while True:
             await asyncio.sleep(1)
             
-    except ValueError:
-        print(f"Error: Invalid port '{sys.argv[1]}'. Must be a number.")
+    except ValueError as e:
+        print(f"Error: {e}")
     except KeyboardInterrupt:
         print("\nShutting down...")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
