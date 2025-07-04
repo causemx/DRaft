@@ -379,9 +379,9 @@ class RaftDroneNode:
         Returns relative positions for all drones (leader gets (0,0))
         
         Args:
-            formation_type: Only 'line' is supported
+            formation_type: 'line' or 'wedge'
             interval: Distance between adjacent drones in meters
-            angle: Rotation angle of the entire line in degrees
+            angle: Rotation angle of the entire formation in degrees
         
         Returns:
             List of (x, y) relative positions for each drone
@@ -391,10 +391,6 @@ class RaftDroneNode:
         
         num_drones = len(self.peers)
         positions = []
-        
-        # Only support line formation
-        if formation_type.lower() != 'line':
-            self.logger.warning(f"Unsupported formation type: {formation_type}. Using line formation.")
         
         # Find leader index in peers list
         leader_index = None
@@ -407,28 +403,70 @@ class RaftDroneNode:
             self.logger.error("Leader not found in peers list!")
             return []
         
-        # Calculate line formation with leader at center
-        for i in range(num_drones):
-            if i == leader_index:
-                # Leader stays at center (0, 0)
-                x, y = 0.0, 0.0
-            else:
-                # Calculate relative position for this drone
-                # Position index relative to leader
-                relative_index = i - leader_index
+        # Calculate formation based on type
+        formation_type_lower = formation_type.lower()
+        
+        if formation_type_lower == 'line':
+            # LINE FORMATION: Symmetric line with leader at center
+            for i in range(num_drones):
+                if i == leader_index:
+                    # Leader stays at center (0, 0)
+                    x, y = 0.0, 0.0
+                else:
+
+                    # Calculate position index relative to leader for symmetric distribution
+                    if i < leader_index:
+                        # Drone is to the left of leader
+                        position_offset = -(leader_index - i)
+                    else:
+                        # Drone is to the right of leader
+                        position_offset = i - leader_index
+                    
+                    # Calculate position along the line
+                    x_offset = position_offset * interval
+                    y_offset = 0.0
+                    
+                    # Apply rotation transformation
+                    angle_rad = math.radians(angle)
+                    x = x_offset * math.cos(angle_rad) - y_offset * math.sin(angle_rad)
+                    y = x_offset * math.sin(angle_rad) + y_offset * math.cos(angle_rad)
                 
-                # Position along the line
-                x_offset = relative_index * interval
-                y_offset = 0.0
+                positions.append((x, y))
+        
+        elif formation_type_lower == 'wedge':
+            # WEDGE FORMATION: V-shape with leader at the tip (center front)
+            for i in range(num_drones):
+                if i == leader_index:
+                    # Leader stays at center front (0, 0)
+                    x, y = 0.0, 0.0
+                else:
+                    # Calculate position index relative to leader
+                    if i < leader_index:
+                        # Drone is on the left side of wedge
+                        position_level = leader_index - i  # 1, 2, 3, ...
+                        x_offset = -position_level * interval  # Negative x (left side)
+                        y_offset = -position_level * interval  # Negative y (behind leader)
+                    else:
+                        # Drone is on the right side of wedge
+                        position_level = i - leader_index  # 1, 2, 3, ...
+                        x_offset = position_level * interval   # Positive x (right side)
+                        y_offset = -position_level * interval  # Negative y (behind leader)
+                    
+                    # Apply rotation transformation
+                    angle_rad = math.radians(angle)
+                    x = x_offset * math.cos(angle_rad) - y_offset * math.sin(angle_rad)
+                    y = x_offset * math.sin(angle_rad) + y_offset * math.cos(angle_rad)
                 
-                # Apply rotation transformation
-                angle_rad = math.radians(angle)
-                x = x_offset * math.cos(angle_rad) - y_offset * math.sin(angle_rad)
-                y = x_offset * math.sin(angle_rad) + y_offset * math.cos(angle_rad)
-            
-            positions.append((x, y))
+                positions.append((x, y))
+        
+        else:
+            self.logger.warning(f"Unsupported formation type: {formation_type}. Using line formation.")
+            # Default to line formation
+            return self.calculate_formation_positions_leader_centered('line', interval, angle)
+        
+        # Log the calculated positions
+        for i, (x, y) in enumerate(positions):
             node_id = self.peers[i][0]
-            
             if i == leader_index:
                 self.logger.info(f"Leader {node_id}: CENTER position (0.0, 0.0)")
             else:
@@ -531,7 +569,7 @@ class RaftDroneNode:
         
         try:
             swarm_cmd = SwarmCommand(**command_data)
-            
+
             if swarm_cmd.command_type == SwarmCommandType.CONNECT_ALL.value:
                 return await self.execute_connect_all()
             
@@ -1255,7 +1293,7 @@ async def main():
     
     try:
         port = int(sys.argv[1])
-        node = await create_single_raft_drone_node(port)
+        await create_single_raft_drone_node(port)
         
         # Keep running
         while True:

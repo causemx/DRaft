@@ -7,7 +7,7 @@ Enhanced with leader-centered formation system
 import asyncio
 import click
 import json
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 
 # Import from raft_node.py and config_manager.py
 try:
@@ -250,42 +250,50 @@ async def land():
         click.echo(f"ERROR: Land command failed: {result.get('error') if result else 'No response'}")
 
 @cli.command()
+@click.argument('formation_type', type=click.Choice(['line', 'wedge']))
 @click.argument('interval', type=float)
 @click.option('--angle', '-a', default=0.0, help='Formation rotation angle in degrees')
 @click.option('--execute', '-e', is_flag=True, help='Execute movement immediately after setting formation')
-async def formation(interval, angle, execute):
-    """Set LEADER-CENTERED LINE formation
+async def formation(formation_type, interval, angle, execute):
+    """Set LEADER-CENTERED formation (LINE or WEDGE)
     
+    FORMATION_TYPE: 'line' or 'wedge'
     INTERVAL: Distance between adjacent drones in meters
     
-    The current leader drone becomes the formation center and stays at its
-    current GPS position. All other drones calculate target positions 
-    relative to the leader's GPS coordinates.
+    LINE FORMATION:
+    The leader drone stays at center, other drones form a straight line.
     
-    Formation Layout (leader at center):
-    drone1 ---- drone2 ---- LEADER ---- drone4 ---- drone5
-                           (CENTER)
+    WEDGE FORMATION:
+    The leader drone stays at tip (front center), other drones form a V-shape behind.
+    Pattern: Left wing drones at (-X, -Y), Right wing drones at (+X, -Y)
     
     Examples:
-        formation 10.0           # 10m spacing, leader at center
-        formation 15.0 -a 45     # Diagonal line, leader at center
-        formation 20.0 -e        # Execute immediately
+        formation line 10.0           # Line formation, 10m spacing
+        formation wedge 15.0          # Wedge formation, 15m spacing
+        formation line 20.0 -a 45     # Diagonal line at 45°
+        formation wedge 25.0 -e       # Wedge formation, execute immediately
     """
     if interval <= 0:
         click.echo("ERROR: Interval must be positive")
         return
     
-    click.echo("Setting LEADER-CENTERED LINE formation:")
-    click.echo(f"   Spacing: {interval}m between drones")
-    click.echo(f"   Angle: {angle}° from horizontal") 
-    click.echo("   Leader: Stays at current GPS position (center)")
+    click.echo(f"Setting LEADER-CENTERED {formation_type.upper()} formation:")
+    click.echo(f"   Type: {formation_type.upper()}")
+    click.echo(f"   Spacing: {interval}m")
+    click.echo(f"   Angle: {angle}° rotation") 
+    click.echo("   Leader: Stays at current GPS position")
     click.echo("   Followers: Move relative to leader's GPS")
     click.echo(f"   Execute: {'Yes' if execute else 'No'}")
+    
+    if formation_type.lower() == 'wedge':
+        click.echo("   Pattern: V-shape with leader at tip (front)")
+    else:
+        click.echo("   Pattern: Straight line with leader at center")
     
     result = await swarm_cli.send_command(
         SwarmCommandType.SET_FORMATION.value,
         {
-            'formation_type': 'line',
+            'formation_type': formation_type,
             'interval': interval,
             'angle': angle,
             'execute': execute
@@ -317,7 +325,7 @@ async def execute_formation():
     if result and result.get('success'):
         moved_nodes = result.get('moved_nodes', 0)
         total_nodes = result.get('total_nodes', 0)
-        click.echo(f"SUCCESS: Formation movement executed")
+        click.echo("SUCCESS: Formation movement executed")
         click.echo(f"   Moved {moved_nodes}/{total_nodes} drones to formation positions")
     else:
         click.echo(f"ERROR: Formation execution failed: {result.get('error') if result else 'No response'}")
@@ -338,7 +346,7 @@ async def formation_step(interval, angle):
         return
     
     # Step 1: Set formation positions
-    click.echo(f"Step 1: Configuring LINE formation...")
+    click.echo("Step 1: Configuring LINE formation...")
     click.echo(f"   Interval: {interval}m")
     click.echo(f"   Angle: {angle}°")
     
@@ -364,12 +372,12 @@ async def formation_step(interval, angle):
     await status.callback()
     
     # Step 2: Execute movement
-    click.echo(f"\nStep 2: Executing movement to LINE formation...")
+    click.echo("\nStep 2: Executing movement to LINE formation...")
     await execute_formation.callback()
     
     # Final status check
     await asyncio.sleep(3)
-    click.echo(f"\nFinal status after formation execution:")
+    click.echo("\nFinal status after formation execution:")
     await status.callback()
 
 @cli.command() 
@@ -409,7 +417,7 @@ async def formation_status():
             target_gps = swarm_state.get('target_gps')
             if target_gps:
                 if target_gps.get('is_leader'):
-                    click.echo(f"     Role: Formation CENTER (stays in place)")
+                    click.echo("     Role: Formation CENTER (stays in place)")
                 else:
                     target_lat = target_gps.get('lat', 0)
                     target_lon = target_gps.get('lon', 0)
@@ -420,7 +428,7 @@ async def formation_status():
             try:
                 node_id = swarm_cli.config_manager.get_node_id_by_port(port)
                 click.echo(f"OFFLINE  {node_id:<8} | Port {port} | Status: Disconnected")
-            except:
+            except Exception:
                 click.echo(f"OFFLINE  Node{port}    | Port {port} | Status: Disconnected")
     
     click.echo("="*90)
@@ -430,10 +438,14 @@ async def formation_status():
         click.echo("No leader found - formation system inactive")
 
 @cli.command()
+@click.argument('formation_type', type=click.Choice(['line', 'wedge']))
 @click.argument('interval', type=float)
 @click.option('--angle', '-a', default=0.0, help='Formation rotation angle')
-async def preview_gps(interval, angle):
+async def preview_gps(formation_type, interval, angle):
     """Preview GPS formation positions relative to current leader
+    
+    FORMATION_TYPE: 'line' or 'wedge'
+    INTERVAL: Distance between drones in meters
     
     Shows where each drone will be positioned relative to the leader's 
     current GPS coordinates.
@@ -463,10 +475,10 @@ async def preview_gps(interval, angle):
     
     leader_lat, leader_lon = leader_pos
     
-    click.echo(f"\nGPS Formation Preview:")
+    click.echo(f"\nGPS Formation Preview ({formation_type.upper()}):")
     click.echo(f"   Leader GPS: {leader_lat:.6f}, {leader_lon:.6f}, {leader_alt:.1f}m")
     click.echo(f"   Spacing: {interval}m between drones")
-    click.echo(f"   Angle: {angle}° from horizontal")
+    click.echo(f"   Angle: {angle}° rotation")
     click.echo("\n" + "="*85)
     click.echo("Node     │ Role     │ GPS Latitude  │ GPS Longitude │ Relative Position")
     click.echo("─"*85)
@@ -489,15 +501,37 @@ async def preview_gps(interval, angle):
         click.echo("ERROR: Cannot determine leader index")
         return
     
+    num_drones = len(all_nodes)
+    
     for i, (node_name, _, _) in enumerate(all_nodes):
         if i == leader_index:
             # Leader stays at center
-            click.echo(f"{node_name:<8} │ CENTER   │ {leader_lat:>12.6f} │ {leader_lon:>12.6f} │ (  0.0,   0.0) [LEADER]")
+            role = "CENTER" if formation_type.lower() == 'line' else "TIP"
+            click.echo(f"{node_name:<8} │ {role:<8} │ {leader_lat:>12.6f} │ {leader_lon:>12.6f} │ (  0.0,   0.0) [LEADER]")
         else:
-            # Calculate follower position
-            relative_index = i - leader_index
-            x_offset = relative_index * interval
-            y_offset = 0.0
+            # Calculate follower position based on formation type
+            if formation_type.lower() == 'line':
+                # Line formation logic
+                if i < leader_index:
+                    position_offset = -(leader_index - i)
+                else:
+                    position_offset = i - leader_index
+                
+                x_offset = position_offset * interval
+                y_offset = 0.0
+                
+            elif formation_type.lower() == 'wedge':
+                # Wedge formation logic
+                if i < leader_index:
+                    # Left wing
+                    position_level = leader_index - i
+                    x_offset = -position_level * interval
+                    y_offset = -position_level * interval
+                else:
+                    # Right wing
+                    position_level = i - leader_index
+                    x_offset = position_level * interval
+                    y_offset = -position_level * interval
             
             # Apply rotation
             angle_rad = math.radians(angle)
@@ -512,7 +546,8 @@ async def preview_gps(interval, angle):
             target_lat = leader_lat + lat_offset
             target_lon = leader_lon + lon_offset
             
-            click.echo(f"{node_name:<8} │ FOLLOW   │ {target_lat:>12.6f} │ {target_lon:>12.6f} │ ({rel_x:+5.1f}, {rel_y:+5.1f})")
+            wing = "LEFT" if (formation_type.lower() == 'wedge' and i < leader_index) else "RIGHT" if (formation_type.lower() == 'wedge' and i > leader_index) else "FOLLOW"
+            click.echo(f"{node_name:<8} │ {wing:<8} │ {target_lat:>12.6f} │ {target_lon:>12.6f} │ ({rel_x:+5.1f}, {rel_y:+5.1f})")
     
     click.echo("="*85)
     click.echo("Note: Leader stays at current GPS position, followers move to calculated positions")
@@ -574,7 +609,7 @@ async def leader():
             if drone_status and drone_status.get('connected'):
                 click.echo(f"   Drone: Connected and {'Armed' if drone_status.get('armed') else 'Disarmed'}")
             else:
-                click.echo(f"   Drone: Not connected")
+                click.echo("   Drone: Not connected")
     else:
         click.echo("ERROR: No leader found in cluster")
 
@@ -709,160 +744,47 @@ async def health():
     else:
         click.echo("ERROR: Cluster is unhealthy - operations not recommended")
 
-@cli.command()
-async def scenario():
-    """Run demonstration scenarios"""
-    scenarios = {
-        '1': 'Basic swarm startup',
-        '2': 'Formation flying',
-        '3': 'Leader failure simulation',
-        '4': 'Full mission demo'
-    }
-    
-    click.echo("Available demonstration scenarios:")
-    for key, desc in scenarios.items():
-        click.echo(f"   {key}. {desc}")
-    
-    choice = click.prompt("Select scenario", type=click.Choice(list(scenarios.keys())))
-    
-    if choice == '1':
-        await scenario_basic_startup()
-    elif choice == '2':
-        await scenario_formation_flying()
-    elif choice == '3':
-        await scenario_leader_failure()
-    elif choice == '4':
-        await scenario_full_mission()
-
-async def scenario_basic_startup():
-    """Basic swarm startup scenario"""
-    click.echo("\nScenario 1: Basic Swarm Startup")
-    click.echo("="*50)
-    
-    steps = [
-        ("Check cluster status", lambda: status.callback()),
-        ("Connect all drones", lambda: connect.callback()),
-        ("Arm all drones", lambda: arm.callback()),
-        ("Take off to 10m", lambda: takeoff.callback(10.0)),
-        ("Check final status", lambda: status.callback())
-    ]
-    
-    for step_name, step_func in steps:
-        click.echo(f"\nStep: {step_name}")
-        await step_func()
-        await asyncio.sleep(2)
-    
-    click.echo("\nBasic startup scenario complete!")
-
-async def scenario_formation_flying():
-    """Formation flying demonstration - LINE FORMATION ONLY"""
-    click.echo("\nScenario 2: Formation Flying - Line Formation Variations")
-    click.echo("="*60)
-    
-    # Different line formation configurations
-    formations = [
-        (15.0, 0, "Horizontal line"),
-        (20.0, 45, "Diagonal line (45°)"), 
-        (25.0, 90, "Vertical line"),
-        (20.0, 135, "Diagonal line (135°)"),
-        (18.0, 180, "Horizontal line (reversed)")
-    ]
-    
-    # Initial setup
-    click.echo("\nInitial setup...")
-    await connect.callback()
-    await asyncio.sleep(1)
-    await arm.callback()
-    await asyncio.sleep(1)
-    await takeoff.callback(15.0)
-    await asyncio.sleep(5)
-    
-    # Demonstrate different line orientations
-    for i, (interval, angle, description) in enumerate(formations, 1):
-        click.echo(f"\nFormation {i}/5: {description}")
-        click.echo(f"   Spacing: {interval}m, Angle: {angle}°")
-        
-        await formation.callback(interval, angle, execute=True)
-        await asyncio.sleep(5)  # Allow movement completion
-        await status.callback()
-        await asyncio.sleep(3)  # Brief pause between formations
-    
-    click.echo("\nLine formation flying scenario complete!")
-
-async def scenario_leader_failure():
-    """Leader failure simulation"""
-    click.echo("\nScenario 3: Leader Failure Simulation")
-    click.echo("="*50)
-    
-    click.echo("\nFinding current leader...")
-    await leader.callback()
-    
-    if swarm_cli.current_leader_port:
-        click.echo(f"\nSimulating leader failure on port {swarm_cli.current_leader_port}")
-        click.echo("   (In real scenario, you would kill the leader process)")
-        click.echo("   Waiting for re-election...")
-        
-        # Reset leader to force re-discovery
-        swarm_cli.current_leader = None
-        swarm_cli.current_leader_port = None
-        
-        await asyncio.sleep(5)
-        await leader.callback()
-    
-    click.echo("\nLeader failure scenario complete!")
-
-async def scenario_full_mission():
-    """Full mission demonstration - LINE FORMATION ONLY"""
-    click.echo("\nScenario 4: Full Mission Demo - Line Formation Operations")
-    click.echo("="*60)
-    
-    mission_steps = [
-        ("System health check", lambda: status.callback()),
-        ("Connect all drones", lambda: connect.callback()),
-        ("Arm swarm", lambda: arm.callback()),
-        ("Mission takeoff", lambda: takeoff.callback(20.0)),
-        ("Formation: Horizontal line", lambda: formation.callback(20.0, 0, execute=True)),
-        ("Formation: Diagonal line", lambda: formation.callback(25.0, 45, execute=True)),
-        ("Formation: Vertical line", lambda: formation.callback(30.0, 90, execute=True)),
-        ("Mission complete - Landing", lambda: land.callback()),
-        ("Disarm swarm", lambda: disarm.callback()),
-        ("Final mission status", lambda: status.callback())
-    ]
-    
-    click.echo(f"\nStarting comprehensive mission with {len(mission_steps)} steps...")
-    
-    for i, (step_name, step_func) in enumerate(mission_steps, 1):
-        click.echo(f"\nStep {i}/{len(mission_steps)}: {step_name}")
-        await step_func()
-        
-        if i < len(mission_steps):
-            wait_time = 5 if "takeoff" in step_name.lower() else 3
-            click.echo(f"   Waiting {wait_time}s before next step...")
-            await asyncio.sleep(wait_time)
-    
-    click.echo("\nFull LINE formation mission scenario complete!")
 
 @cli.command()
 async def formation_help():
-    """Show detailed help about LINE formation system"""
+    """Show detailed help about formation systems"""
     help_text = """
-LEADER-CENTERED LINE FORMATION SYSTEM
+LEADER-CENTERED FORMATION SYSTEM
 
 OVERVIEW:
-The swarm supports LINE formation only, arranging all drones in a 
-straight line with the leader staying at its current GPS position.
+The swarm supports two formation types: LINE and WEDGE
+Both formations keep the leader at the center/tip position.
+
+FORMATION TYPES:
+
+1. LINE FORMATION:
+   • All drones arranged in a straight line
+   • Leader stays at center of the line
+   • Equal spacing between adjacent drones
+   • Symmetric distribution around leader
+
+   Example (5 drones, 10m spacing):
+   drone1 ---- drone2 ---- LEADER ---- drone4 ---- drone5
+   (-20,0)    (-10,0)       (0,0)      (10,0)     (20,0)
+
+2. WEDGE FORMATION:
+   • V-shaped arrangement with leader at tip
+   • Leader stays at front center (tip of V)
+   • Drones form symmetric wings behind leader
+   • Diagonal spacing creates V-shape
+
+   Example (5 drones, 10m spacing):
+                    LEADER (0,0)
+                   /          \\
+           drone2(-10,-10)   drone4(10,-10)
+          /                              \\
+   drone1(-20,-20)                  drone5(20,-20)
 
 LEADER-CENTERED CONCEPT:
-• Current Raft leader becomes formation center point
+• Current Raft leader becomes formation reference point
 • Leader stays at its current GPS coordinates
 • All other drones calculate target positions relative to leader's GPS
-• Only follower drones move; leader conserves energy and maintains stability
-
-GEOMETRY:
-• All drones positioned on a straight line
-• Equal interval between adjacent drones  
-• Formation centered on leader's GPS position
-• Configurable rotation angle
+• Only follower drones move; leader conserves energy
 
 COORDINATE SYSTEM:
 • Origin: Leader's GPS position
@@ -870,42 +792,35 @@ COORDINATE SYSTEM:
 • Y-axis: North (positive up ↑)  
 • Angles: Counter-clockwise from East
 
-ANGLE REFERENCE:
-•   0° = Horizontal line pointing right (→)
-•  45° = Diagonal up-right (↗)
-•  90° = Vertical line pointing up (↑)
-• 135° = Diagonal up-left (↖)
-• 180° = Horizontal line pointing left (←)
-
 COMMANDS:
-formation <interval> [--angle N] [--execute]
-    Set line formation with leader at center
+formation <type> <interval> [--angle N] [--execute]
+    Set formation with leader at center/tip
+    Types: line, wedge
 
-formation_step <interval> [--angle N]  
-    Set formation and execute in separate steps
-
-preview_gps <interval> [--angle N]
-    Preview GPS positions relative to current leader
+preview_gps <type> <interval> [--angle N]
+    Preview GPS positions for formation type
 
 formation_status
     Show current formation assignments and GPS targets
 
 EXAMPLES:
-formation 10.0                    # Basic horizontal line, leader at center
-formation 15.0 -a 45             # Diagonal line at 45°, leader at center
-formation 20.0 -a 90 -e          # Vertical line, execute immediately
-preview_gps 25.0 -a 30           # Preview diagonal formation GPS positions
+formation line 10.0                    # Horizontal line, leader at center
+formation wedge 15.0                   # V-shaped wedge, leader at tip
+formation line 20.0 -a 45             # Diagonal line at 45°
+formation wedge 25.0 -a 90 -e          # Sideways wedge, execute immediately
+preview_gps wedge 30.0 -a 30           # Preview rotated wedge formation
 
-GPS CALCULATION:
-• Relative positions converted to actual GPS coordinates
-• Uses Earth geometry for accurate positioning
-• Accounts for latitude variation in longitude calculations
-• Maintains formation integrity across different geographic locations
+WEDGE FORMATION DETAILS:
+• Leader at tip (front center): (0, 0)
+• Left wing: negative X, negative Y coordinates
+• Right wing: positive X, negative Y coordinates
+• Spacing determines both horizontal and vertical separation
+• Perfect for tactical formations and wind management
 
 CONFIGURATION:
-• Drone connections and ports are loaded from config.ini
+• Drone connections and ports loaded from config.ini
 • Each drone has its own connection string and node port
-• Configuration can be viewed with 'config' command
+• View configuration with 'config' command
     """
     click.echo(help_text)
 

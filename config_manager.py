@@ -23,7 +23,7 @@ class ConfigManager:
             raise FileNotFoundError(f"Configuration file '{self.config_file}' not found")
         
         self.config.read(self.config_file)
-        logging.info(f"Configuration loaded from {self.config_file}")
+        logging.debug(f"Configuration loaded from {self.config_file}")
     
     def get_drone_connection(self, drone_index: int) -> str:
         """Get drone connection string by index"""
