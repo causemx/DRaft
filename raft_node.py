@@ -52,6 +52,54 @@ class SwarmCommandType(Enum):
     GET_SWARM_STATUS = "get_swarm_status"
     INDIVIDUAL_COMMAND = "individual_command"
 
+class CircularNodeList:
+    """Circular linked list for symmetric node distribution around leader"""
+    
+    def __init__(self, nodes: List[Tuple[str, int]]):
+        """Initialize with sorted list of (node_id, port) tuples"""
+        # Sort nodes by node_id for consistent ordering
+        self.nodes = sorted(nodes, key=lambda x: x[0])
+        self.size = len(self.nodes)
+    
+    def get_node_index(self, node_id: str) -> int:
+        """Get index of node in the circular list"""
+        for i, (nid, _) in enumerate(self.nodes):
+            if nid == node_id:
+                return i
+        return -1
+    
+    def get_symmetric_distribution(self, leader_node_id: str) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+        """
+        Get symmetric distribution of nodes around leader
+        Returns: (left_side_nodes, right_side_nodes)
+        """
+        leader_idx = self.get_node_index(leader_node_id)
+        if leader_idx == -1:
+            raise ValueError(f"Leader node {leader_node_id} not found")
+        
+        if self.size <= 1:
+            return [], []
+        
+        # Calculate how many nodes go on each side
+        remaining_nodes = self.size - 1  # Exclude leader
+        left_count = remaining_nodes // 2
+        right_count = remaining_nodes - left_count
+        
+        left_side = []
+        right_side = []
+        
+        # Fill left side (going backwards in circular fashion)
+        for i in range(1, left_count + 1):
+            idx = (leader_idx - i) % self.size
+            left_side.append(self.nodes[idx])
+        
+        # Fill right side (going forwards in circular fashion)
+        for i in range(1, right_count + 1):
+            idx = (leader_idx + i) % self.size
+            right_side.append(self.nodes[idx])
+        
+        return left_side, right_side
+
 @dataclass
 class LogEntry:
     term: int
@@ -375,8 +423,7 @@ class RaftDroneNode:
     
     def calculate_formation_positions_leader_centered(self, formation_type: str, interval: float, angle: float = 0.0) -> List[Tuple[float, float]]:
         """
-        Calculate formation positions with LEADER AT CENTER
-        Returns relative positions for all drones (leader gets (0,0))
+        Calculate formation positions using circular linked list for symmetric distribution
         
         Args:
             formation_type: 'line' or 'wedge'
@@ -389,38 +436,48 @@ class RaftDroneNode:
         """
         import math
         
-        num_drones = len(self.peers)
-        positions = []
+        # Create circular node list from all peers (including leader)
+        all_nodes = [(node_id, port) for node_id, port in self.peers]
+        circular_list = CircularNodeList(all_nodes)
         
-        # Find leader index in peers list
-        leader_index = None
-        for i, (node_id, _) in enumerate(self.peers):
-            if node_id == self.node_id:
-                leader_index = i
-                break
+        # Get symmetric distribution
+        left_side, right_side = circular_list.get_symmetric_distribution(self.node_id)
         
-        if leader_index is None:
-            self.logger.error("Leader not found in peers list!")
-            return []
+        # Log the circular distribution
+        self.logger.info(f"Circular distribution for leader {self.node_id}:")
+        self.logger.info(f"  Left side: {[n[0] for n in left_side]}")
+        self.logger.info(f"  Right side: {[n[0] for n in right_side]}")
         
-        # Calculate formation based on type
+        # Create formation order: left nodes (reversed) + leader + right nodes
+        formation_order = []
+        
+        # Add left side nodes (in reverse order for proper left-to-right positioning)
+        for node in reversed(left_side):
+            formation_order.append(node)
+        
+        # Add leader
+        leader_idx = circular_list.get_node_index(self.node_id)
+        formation_order.append(circular_list.nodes[leader_idx])
+        
+        # Add right side nodes
+        for node in right_side:
+            formation_order.append(node)
+        
+        # Calculate positions based on formation type
+        positions_dict = {}
         formation_type_lower = formation_type.lower()
         
         if formation_type_lower == 'line':
             # LINE FORMATION: Symmetric line with leader at center
-            for i in range(num_drones):
-                if i == leader_index:
+            leader_pos_in_order = len(left_side)  # Leader is after all left nodes
+            
+            for i, (node_id, _) in enumerate(formation_order):
+                if i == leader_pos_in_order:
                     # Leader stays at center (0, 0)
                     x, y = 0.0, 0.0
                 else:
-
-                    # Calculate position index relative to leader for symmetric distribution
-                    if i < leader_index:
-                        # Drone is to the left of leader
-                        position_offset = -(leader_index - i)
-                    else:
-                        # Drone is to the right of leader
-                        position_offset = i - leader_index
+                    # Calculate position relative to leader center
+                    position_offset = i - leader_pos_in_order
                     
                     # Calculate position along the line
                     x_offset = position_offset * interval
@@ -431,48 +488,54 @@ class RaftDroneNode:
                     x = x_offset * math.cos(angle_rad) - y_offset * math.sin(angle_rad)
                     y = x_offset * math.sin(angle_rad) + y_offset * math.cos(angle_rad)
                 
-                positions.append((x, y))
+                positions_dict[node_id] = (x, y)
+                role = "CENTER" if i == leader_pos_in_order else f"LEFT-{leader_pos_in_order-i}" if i < leader_pos_in_order else f"RIGHT-{i-leader_pos_in_order}"
+                self.logger.info(f"  {node_id} ({role}): position ({x:.1f}, {y:.1f})")
         
         elif formation_type_lower == 'wedge':
             # WEDGE FORMATION: V-shape with leader at the tip (center front)
-            for i in range(num_drones):
-                if i == leader_index:
+            leader_pos_in_order = len(left_side)  # Leader is after all left nodes
+            
+            for i, (node_id, _) in enumerate(formation_order):
+                if i == leader_pos_in_order:
                     # Leader stays at center front (0, 0)
                     x, y = 0.0, 0.0
+                elif i < leader_pos_in_order:
+                    # Left wing of the wedge
+                    level = leader_pos_in_order - i  # 1, 2, 3, ...
+                    x_offset = -level * interval  # Negative x (left side)
+                    y_offset = -level * interval  # Negative y (behind leader)
+                    
+                    # Apply rotation transformation
+                    angle_rad = math.radians(angle)
+                    x = x_offset * math.cos(angle_rad) - y_offset * math.sin(angle_rad)
+                    y = x_offset * math.sin(angle_rad) + y_offset * math.cos(angle_rad)
+                    
                 else:
-                    # Calculate position index relative to leader
-                    if i < leader_index:
-                        # Drone is on the left side of wedge
-                        position_level = leader_index - i  # 1, 2, 3, ...
-                        x_offset = -position_level * interval  # Negative x (left side)
-                        y_offset = -position_level * interval  # Negative y (behind leader)
-                    else:
-                        # Drone is on the right side of wedge
-                        position_level = i - leader_index  # 1, 2, 3, ...
-                        x_offset = position_level * interval   # Positive x (right side)
-                        y_offset = -position_level * interval  # Negative y (behind leader)
+                    # Right wing of the wedge
+                    level = i - leader_pos_in_order  # 1, 2, 3, ...
+                    x_offset = level * interval   # Positive x (right side)
+                    y_offset = -level * interval  # Negative y (behind leader)
                     
                     # Apply rotation transformation
                     angle_rad = math.radians(angle)
                     x = x_offset * math.cos(angle_rad) - y_offset * math.sin(angle_rad)
                     y = x_offset * math.sin(angle_rad) + y_offset * math.cos(angle_rad)
                 
-                positions.append((x, y))
+                positions_dict[node_id] = (x, y)
+                role = "TIP" if i == leader_pos_in_order else f"LEFT-{leader_pos_in_order-i}" if i < leader_pos_in_order else f"RIGHT-{i-leader_pos_in_order}"
+                self.logger.info(f"  {node_id} ({role}): position ({x:.1f}, {y:.1f})")
         
         else:
             self.logger.warning(f"Unsupported formation type: {formation_type}. Using line formation.")
-            # Default to line formation
             return self.calculate_formation_positions_leader_centered('line', interval, angle)
         
-        # Log the calculated positions
-        for i, (x, y) in enumerate(positions):
-            node_id = self.peers[i][0]
-            if i == leader_index:
-                self.logger.info(f"Leader {node_id}: CENTER position (0.0, 0.0)")
-            else:
-                self.logger.info(f"Follower {node_id}: relative position ({x:.1f}, {y:.1f})")
+        # Return positions in the same order as all_nodes (original peer order)
+        final_positions = []
+        for node_id, _ in all_nodes:
+            final_positions.append(positions_dict[node_id])
         
-        return positions
+        return final_positions
 
     async def handle_client_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle incoming client connections"""
@@ -641,7 +704,7 @@ class RaftDroneNode:
     
     async def execute_set_formation(self, parameters: Dict) -> Dict:
         """
-        Set formation for the swarm - LEADER-CENTERED VERSION
+        Set formation for the swarm using circular distribution - LEADER-CENTERED VERSION
         Leader stays at current position, others move relative to leader's GPS coordinates
         """
         formation_type = parameters.get('formation_type')
@@ -661,7 +724,15 @@ class RaftDroneNode:
         
         self.logger.info(f"Leader {self.node_id} GPS: {leader_lat:.6f}, {leader_lon:.6f}, {leader_alt:.1f}m")
         
-        # Calculate formation positions relative to leader
+        # Create circular node list and log distribution
+        all_nodes = [(node_id, port) for node_id, port in self.peers]
+        circular_list = CircularNodeList(all_nodes)
+        left_side, right_side = circular_list.get_symmetric_distribution(self.node_id)
+        
+        self.logger.info(f"Formation: {formation_type.upper()} with {interval}m spacing")
+        self.logger.info(f"Circular distribution - Left: {[n[0] for n in left_side]}, Right: {[n[0] for n in right_side]}")
+        
+        # Calculate formation positions using circular method
         relative_positions = self.calculate_formation_positions_leader_centered(
             formation_type, interval, angle
         )
@@ -669,7 +740,7 @@ class RaftDroneNode:
         # Convert relative positions to GPS coordinates
         formation_assignment = {}
         
-        for i, (node_id, _) in enumerate(self.peers):
+        for i, (node_id, _) in enumerate(all_nodes):
             if node_id == self.node_id:
                 # Leader stays at current position
                 formation_assignment[node_id] = {
@@ -699,20 +770,28 @@ class RaftDroneNode:
             'formation_type': formation_type,
             'leader_id': self.node_id,
             'leader_gps': {'lat': leader_lat, 'lon': leader_lon, 'alt': leader_alt},
-            'assignments': formation_assignment
+            'assignments': formation_assignment,
+            'circular_distribution': {
+                'left_side': [n[0] for n in left_side],
+                'right_side': [n[0] for n in right_side]
+            }
         })}"
         
         success = await self.replicate_command(command)
         
         result = {
             'success': success,
-            'command': 'SET_FORMATION_GPS',
+            'command': 'SET_FORMATION_GPS_CIRCULAR',
             'formation_type': formation_type,
             'leader_id': self.node_id,
             'leader_position': {'lat': leader_lat, 'lon': leader_lon, 'alt': leader_alt},
             'positions_set': len(formation_assignment) if success else 0,
             'interval': interval,
-            'angle': angle
+            'angle': angle,
+            'circular_distribution': {
+                'left_side': [n[0] for n in left_side],
+                'right_side': [n[0] for n in right_side]
+            }
         }
         
         # If execute immediately is requested
