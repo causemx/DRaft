@@ -9,146 +9,84 @@ import asyncio
 import json
 import random
 import time
-import logging
 import struct
-from enum import Enum
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional, Tuple, Any
-from libs.utils import DroneController, FlightMode
-from libs.cal import Calculator
+from dataclasses import asdict
+from libs.control import DroneController
+from util.cal import Calculator
+from util.data_struct import CircularNodeList
+from util.logger_helper import LoggerFactory
 from config_manager import get_config_manager
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+from typing import List, Dict, Optional, Tuple, Set
+from message import (
+    Message, 
+    LogEntry, 
+    NodeState, 
+    MessageType, 
+    VoteRequest, 
+    VoteResponse,
+    AppendEntriesRequest,
+    AppendEntriesResponse,
+    SwarmCommand,
+    SwarmCommandType,
+)
 
 # Global configuration manager
 config_manager = get_config_manager()
+logger = LoggerFactory.get_logger(name="raft_node.py")
 
-class NodeState(Enum):
-    FOLLOWER = "follower"
-    CANDIDATE = "candidate"
-    LEADER = "leader"
 
-class MessageType(Enum):
-    VOTE_REQUEST = "vote_request"
-    VOTE_RESPONSE = "vote_response"
-    APPEND_ENTRIES = "append_entries"
-    APPEND_RESPONSE = "append_response"
-    CLIENT_REQUEST = "client_request"
-    CLIENT_RESPONSE = "client_response"
-    STATUS_REQUEST = "status_request"
-    STATUS_RESPONSE = "status_response"
-    SWARM_COMMAND = "swarm_command"
-    SWARM_RESPONSE = "swarm_response"
 
-class SwarmCommandType(Enum):
-    CONNECT_ALL = "connect_all"
-    ARM_ALL = "arm_all"
-    DISARM_ALL = "disarm_all"
-    TAKEOFF_ALL = "takeoff_all"
-    LAND_ALL = "land_all"
-    SET_FORMATION = "set_formation"
-    EXECUTE_FORMATION = "execute_formation"
-    GET_SWARM_STATUS = "get_swarm_status"
-    INDIVIDUAL_COMMAND = "individual_command"
-
-class CircularNodeList:
-    """Circular linked list for symmetric node distribution around leader"""
+class PeerHealthTracker:
+    """Tracks the health status of peer nodes"""
     
-    def __init__(self, nodes: List[Tuple[str, int]]):
-        """Initialize with sorted list of (node_id, port) tuples"""
-        # Sort nodes by node_id for consistent ordering
-        self.nodes = sorted(nodes, key=lambda x: x[0])
-        self.size = len(self.nodes)
+    def __init__(self, node_id: str, heartbeat_timeout: float = 10.0):
+        self.node_id = node_id
+        self.heartbeat_timeout = heartbeat_timeout
+        self.peer_health: Dict[str, float] = {}  # peer_id -> last_seen_timestamp
+        self.failed_peers: Set[str] = set()
+        
+    def update_peer_heartbeat(self, peer_id: str):
+        """Update the last seen time for a peer"""
+        self.peer_health[peer_id] = time.time()
+        # Remove from failed peers if it was there
+        self.failed_peers.discard(peer_id)
+        
+    def mark_peer_failed(self, peer_id: str):
+        """Manually mark a peer as failed"""
+        if peer_id != self.node_id:  # Don't mark self as failed
+            self.failed_peers.add(peer_id)
+        
+    def get_active_peers(self, all_peers: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+        """Get list of currently active (non-failed) peers"""
+        current_time = time.time()
+        active_peers = []
+        
+        for peer_id, peer_port in all_peers:
+            # Always include self
+            if peer_id == self.node_id:
+                active_peers.append((peer_id, peer_port))
+                continue
+                
+            # Check if peer is manually marked as failed
+            if peer_id in self.failed_peers:
+                continue
+                
+            # Check if we've seen a heartbeat recently
+            last_seen = self.peer_health.get(peer_id, 0)
+            if current_time - last_seen > self.heartbeat_timeout:
+                # Mark as failed due to timeout
+                self.failed_peers.add(peer_id)
+                continue
+                
+            active_peers.append((peer_id, peer_port))
+        
+        return active_peers
     
-    def get_node_index(self, node_id: str) -> int:
-        """Get index of node in the circular list"""
-        for i, (nid, _) in enumerate(self.nodes):
-            if nid == node_id:
-                return i
-        return -1
-    
-    def get_symmetric_distribution(self, leader_node_id: str) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
-        """
-        Get symmetric distribution of nodes around leader
-        Returns: (left_side_nodes, right_side_nodes)
-        """
-        leader_idx = self.get_node_index(leader_node_id)
-        if leader_idx == -1:
-            raise ValueError(f"Leader node {leader_node_id} not found")
-        
-        if self.size <= 1:
-            return [], []
-        
-        # Calculate how many nodes go on each side
-        remaining_nodes = self.size - 1  # Exclude leader
-        left_count = remaining_nodes // 2
-        right_count = remaining_nodes - left_count
-        
-        left_side = []
-        right_side = []
-        
-        # Fill left side (going backwards in circular fashion)
-        for i in range(1, left_count + 1):
-            idx = (leader_idx - i) % self.size
-            left_side.append(self.nodes[idx])
-        
-        # Fill right side (going forwards in circular fashion)
-        for i in range(1, right_count + 1):
-            idx = (leader_idx + i) % self.size
-            right_side.append(self.nodes[idx])
-        
-        return left_side, right_side
+    def get_failed_peers(self) -> Set[str]:
+        """Get set of failed peer IDs"""
+        return self.failed_peers.copy()
 
-@dataclass
-class LogEntry:
-    term: int
-    index: int
-    command: str
-    timestamp: float = None
 
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = time.time()
-
-@dataclass
-class Message:
-    msg_type: str
-    data: Dict[str, Any]
-    sender_id: str
-
-@dataclass
-class VoteRequest:
-    term: int
-    candidate_id: str
-    last_log_index: int
-    last_log_term: int
-
-@dataclass
-class VoteResponse:
-    term: int
-    vote_granted: bool
-
-@dataclass
-class AppendEntriesRequest:
-    term: int
-    leader_id: str
-    prev_log_index: int
-    prev_log_term: int
-    entries: List[Dict]  # Serialized LogEntry objects
-    leader_commit: int
-
-@dataclass
-class AppendEntriesResponse:
-    term: int
-    success: bool
-    match_index: int = -1
-
-@dataclass
-class SwarmCommand:
-    command_type: str
-    parameters: Dict[str, Any]
-    target_nodes: List[str] = None  # None means all nodes
 
 class SocketProtocol:
     """Simple protocol for sending/receiving messages over TCP"""
@@ -169,7 +107,7 @@ class SocketProtocol:
             writer.write(length + json_data)
             await writer.drain()
         except Exception as e:
-            logging.error(f"Error sending message: {e}")
+            logger.error(f"Error sending message: {e}")
     
     @staticmethod
     async def receive_message(reader: asyncio.StreamReader) -> Optional[Message]:
@@ -192,7 +130,7 @@ class SocketProtocol:
                 sender_id=data['sender_id']
             )
         except (asyncio.IncompleteReadError, json.JSONDecodeError, struct.error) as e:
-            logging.debug(f"Error receiving message: {e}")
+            logger.debug(f"Error receiving message: {e}")
             return None
 
 class RaftDroneNode:
@@ -234,6 +172,13 @@ class RaftDroneNode:
         self.election_task: Optional[asyncio.Task] = None
         self.drone_monitor_task: Optional[asyncio.Task] = None
         
+        # Peer Health Tracker
+        self.health_tracker = PeerHealthTracker(node_id)
+    
+        # formation tracking
+        self.last_formation_config = None
+        self.last_formation_time = 0
+        
         # Swarm coordination
         self.swarm_state = {
             'formation_type': None,
@@ -243,15 +188,53 @@ class RaftDroneNode:
             'leader_gps': None
         }
         
-        self.logger = logging.getLogger(f"RaftDrone-{self.node_id}")
         
     def _random_election_timeout(self) -> float:
         """Random election timeout between 1.5-3 seconds"""
         return random.uniform(1.5, 3.0)
     
+    def get_active_peers(self) -> List[Tuple[str, int]]:
+        """Get currently active (non-failed) peers"""
+        return self.health_tracker.get_active_peers(self.peers)
+
+    def handle_peer_communication_failure(self, peer_id: str):
+        """Handle communication failure with a peer"""
+        # logger.warning(f"Communication failed with peer {peer_id}")
+        self.health_tracker.mark_peer_failed(peer_id)
+        
+        # If we're the leader and have an active formation, recalculate
+        if (self.state == NodeState.LEADER and 
+            self.last_formation_config and 
+            time.time() - self.last_formation_time > 5.0):  # TODO Don't recalculate too frequently
+            logger.info("Triggering formation recalculation due to peer failure")
+            asyncio.create_task(self.recalculate_formation())
+
+    def handle_successful_peer_communication(self, peer_id: str):
+        """Handle successful communication with a peer"""
+        self.health_tracker.update_peer_heartbeat(peer_id)
+    
+    async def recalculate_formation(self):
+        """Recalculate formation with current active nodes"""
+        if not self.last_formation_config:
+            return
+            
+        failed_peers = self.health_tracker.get_failed_peers()
+        active_peers = self.get_active_peers()
+        
+        logger.info(f"Recalculating formation: {len(active_peers)} active, {len(failed_peers)} failed")
+        
+        # Re-execute the last formation command with current active nodes
+        result = await self.execute_set_formation(self.last_formation_config)
+        
+        if result.get('success'):
+            logger.info("Formation recalculated successfully")
+            self.last_formation_time = time.time()
+        else:
+            logger.error(f"Formation recalculation failed: {result.get('error')}")
+    
     async def start(self):
         """Start the Raft node and drone connection"""
-        self.logger.info(f"Starting Raft-Drone node {self.node_id} on port {self.port}")
+        logger.info(f"Starting Raft-Drone node {self.node_id} on port {self.port}")
         
         # Connect to drone
         await self.connect_drone()
@@ -269,7 +252,7 @@ class RaftDroneNode:
         # Start drone monitoring
         self.drone_monitor_task = asyncio.create_task(self.drone_monitor_loop())
         
-        self.logger.info(f"Node {self.node_id} is listening on port {self.port}")
+        logger.info(f"Node {self.node_id} is listening on port {self.port}")
     
     async def connect_drone(self):
         """Connect to the drone"""
@@ -281,14 +264,14 @@ class RaftDroneNode:
             )
             if connected:
                 self.drone_connected = True
-                self.logger.info(f"Connected to drone {self.drone_index}")
+                logger.info(f"Connected to drone {self.drone_index}")
             else:
-                self.logger.error(f"Failed to connect to drone {self.drone_index}")
+                logger.error(f"Failed to connect to drone {self.drone_index}")
         except Exception as e:
-            self.logger.error(f"Error connecting to drone: {e}")
+            logger.error(f"Error connecting to drone: {e}")
     
     async def drone_monitor_loop(self):
-        """Monitor drone status and apply committed commands"""
+        """Monitor drone status and apply committed commands - WITH HEALTH MONITORING"""
         while True:
             try:
                 # Apply any committed but not applied log entries
@@ -298,67 +281,107 @@ class RaftDroneNode:
                         entry = self.log[self.last_applied - 1]
                         await self.apply_command(entry.command)
                 
+                # If we're leader, check for failed peers and recalculate formation if needed
+                if self.state == NodeState.LEADER:
+                    failed_peers = self.health_tracker.get_failed_peers()
+                    if (failed_peers and 
+                        self.last_formation_config and 
+                        time.time() - self.last_formation_time > 10.0):  # Check every 10 seconds
+                        
+                        logger.info(f"Detected {len(failed_peers)} failed peers, checking if formation recalculation needed")
+                        await self.recalculate_formation()
+                
                 await asyncio.sleep(0.1)  # Check every 100ms
             except Exception as e:
-                self.logger.error(f"Error in drone monitor loop: {e}")
+                logger.error(f"Error in drone monitor loop: {e}")
                 await asyncio.sleep(1)
     
     async def apply_command(self, command: str):
-        """Apply a committed command to the drone"""
+        """
+        Apply a committed command to the drone
+        SIMPLIFIED VERSION - Only essential commands for basic swarm operation
+        
+        Args:
+            command: Command string in format "COMMAND_TYPE:JSON_DATA"
+        """
         try:
             if not self.drone_connected:
-                self.logger.warning(f"Cannot apply command '{command}' - drone not connected")
+                logger.warning(f"Cannot apply command '{command}' - drone not connected")
                 return
             
-            # Parse command
+            # Parse command format: "COMMAND_TYPE:JSON_DATA"
             parts = command.split(':', 1)
             if len(parts) != 2:
-                self.logger.warning(f"Invalid command format: {command}")
+                logger.warning(f"Invalid command format: {command}")
                 return
             
             cmd_type, cmd_data = parts
-            data = json.loads(cmd_data) if cmd_data else {}
             
+            # Parse JSON data
+            try:
+                data = json.loads(cmd_data) if cmd_data.strip() else {}
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in command '{command}': {e}")
+                return
+            
+            # Get asyncio loop for blocking operations
             loop = asyncio.get_event_loop()
+            
+            logger.info(f"Applying command: {cmd_type}")
+            
+            # ========== BASIC DRONE COMMANDS ==========
             
             if cmd_type in ["ARM", "ARM_ALL"]:
                 result = await loop.run_in_executor(None, self.drone_controller.arm)
-                self.logger.info(f"Applied ARM command to drone {self.drone_index}: {'SUCCESS' if result else 'FAILED'}")
+                logger.info(f"ARM command: {'SUCCESS' if result else 'FAILED'}")
             
             elif cmd_type in ["DISARM", "DISARM_ALL"]:
                 result = await loop.run_in_executor(None, self.drone_controller.disarm)
-                self.logger.info(f"Applied DISARM command to drone {self.drone_index}: {'SUCCESS' if result else 'FAILED'}")
+                logger.info(f"DISARM command: {'SUCCESS' if result else 'FAILED'}")
             
             elif cmd_type in ["TAKEOFF", "TAKEOFF_ALL"]:
                 altitude = data.get('altitude', 10.0)
                 result = await loop.run_in_executor(None, self.drone_controller.takeoff, altitude)
-                self.logger.info(f"Applied TAKEOFF command to drone {self.drone_index} at {altitude}m: {'SUCCESS' if result else 'FAILED'}")
+                logger.info(f"TAKEOFF to {altitude}m: {'SUCCESS' if result else 'FAILED'}")
             
             elif cmd_type in ["LAND", "LAND_ALL"]:
                 result = await loop.run_in_executor(None, self.drone_controller.land)
-                self.logger.info(f"Applied LAND command to drone {self.drone_index}: {'SUCCESS' if result else 'FAILED'}")
+                logger.info(f"LAND command: {'SUCCESS' if result else 'FAILED'}")
             
             elif cmd_type == "SET_MODE":
                 mode = data.get('mode', 'GUIDED')
                 result = await loop.run_in_executor(None, self.drone_controller.set_flight_mode, mode)
-                self.logger.info(f"Applied SET_MODE command to drone {self.drone_index}: {mode} - {'SUCCESS' if result else 'FAILED'}")
+                logger.info(f"SET_MODE to {mode}: {'SUCCESS' if result else 'FAILED'}")
             
-            elif cmd_type == "FLY_TO":
-                distance = data.get('distance', 0)
-                angle = data.get('angle', 0)
-                result = await loop.run_in_executor(None, self.drone_controller.fly_to_here, distance, angle)
-                self.logger.info(f"Applied FLY_TO command to drone {self.drone_index}: {distance}m at {angle}° - {'SUCCESS' if result else 'FAILED'}")
+            # ========== FORMATION COMMANDS ==========
             
             elif cmd_type == "SET_FORMATION_GPS":
+                """Handle GPS-based formation assignment with dynamic peer management"""
                 leader_id = data.get('leader_id')
                 leader_gps = data.get('leader_gps', {})
                 assignments = data.get('assignments', {})
+                active_nodes = data.get('active_nodes', [])
+                excluded_nodes = data.get('excluded_failed_nodes', [])
+                formation_type = data.get('formation_type', 'unknown')
                 
-                # Find this node's assignment
+                # Log formation info
+                logger.info(f"Formation update: {formation_type}, Leader: {leader_id}")
+                logger.info(f"Active nodes: {active_nodes}")
+                if excluded_nodes:
+                    logger.warning(f"Excluded failed nodes: {excluded_nodes}")
+                
+                # Check if this node is excluded due to failure
+                if self.node_id in excluded_nodes:
+                    logger.warning(f"Node {self.node_id} excluded from formation")
+                    self.swarm_state['formation_role'] = 'excluded'
+                    self.swarm_state['target_gps'] = None
+                    return
+                
+                # Get this node's assignment
                 my_assignment = assignments.get(self.node_id)
                 if my_assignment:
                     if my_assignment.get('is_leader'):
-                        self.logger.info(f"Leader {self.node_id} maintains center position at GPS: {leader_gps}")
+                        logger.info(f"Leader {self.node_id} stays at center: {leader_gps}")
                         self.swarm_state['formation_role'] = 'leader_center'
                     else:
                         target_lat = my_assignment['lat']
@@ -366,64 +389,77 @@ class RaftDroneNode:
                         target_alt = my_assignment['alt']
                         rel_pos = my_assignment['relative_pos']
                         
-                        self.logger.info(f"Follower {self.node_id} target GPS: {target_lat:.6f}, {target_lon:.6f}")
-                        self.logger.info(f"Relative to leader: {rel_pos[0]:.1f}m East, {rel_pos[1]:.1f}m North")
-                        
+                        logger.info(f"Follower {self.node_id} target: {target_lat:.6f}, {target_lon:.6f}")
+                        logger.info(f"Relative: {rel_pos[0]:+.1f}m East, {rel_pos[1]:+.1f}m North")
                         self.swarm_state['formation_role'] = 'follower'
                     
                     # Store formation data
-                    self.swarm_state['formation_type'] = data.get('formation_type')
+                    self.swarm_state['formation_type'] = formation_type
                     self.swarm_state['target_gps'] = my_assignment
                     self.swarm_state['leader_id'] = leader_id
                     self.swarm_state['leader_gps'] = leader_gps
+                    self.swarm_state['excluded_nodes'] = excluded_nodes
                 else:
-                    self.logger.warning(f"No formation assignment for {self.node_id}")
+                    logger.warning(f"No formation assignment for {self.node_id}")
             
-            elif cmd_type == "EXECUTE_GPS_FORMATION":
-                # Execute movement to GPS formation position
+            elif cmd_type in ["EXECUTE_FORMATION", "EXECUTE_GPS_FORMATION"]:
+                """Execute movement to formation position"""
                 target_gps = self.swarm_state.get('target_gps')
-                if target_gps and not target_gps.get('is_leader'):
-                    # Only followers move, leader stays in place
-                    target_lat = target_gps['lat']
-                    target_lon = target_gps['lon']
-                    target_alt = target_gps['alt']
+                formation_role = self.swarm_state.get('formation_role')
+                
+                if not target_gps:
+                    logger.warning(f"No formation target for {self.node_id}")
+                    return
+                
+                if formation_role == 'excluded':
+                    logger.warning(f"Node {self.node_id} excluded from formation movement")
+                    return
+                
+                if target_gps.get('is_leader'):
+                    logger.info(f"Leader {self.node_id} stays at center - no movement")
+                    return
+                
+                # Follower movement
+                target_lat = target_gps['lat']
+                target_lon = target_gps['lon'] 
+                target_alt = target_gps['alt']
+                
+                # Get current position
+                current_status = self.get_drone_status()
+                current_pos = current_status.get('position')
+                
+                if current_pos:
+                    current_lat, current_lon = current_pos
                     
-                    # Get current position
-                    current_status = self.get_drone_status()
-                    current_pos = current_status.get('position')
+                    # Calculate distance to target
+                    from util.cal import Calculator
+                    distance, bearing = Calculator.calculate_distance_bearing(
+                        current_lat, current_lon, target_lat, target_lon
+                    )
                     
-                    if current_pos:
-                        current_lat, current_lon = current_pos
-                        
-                        # Calculate distance and bearing to target
-                        distance, bearing = Calculator.calculate_distance_bearing(
-                            current_lat, current_lon, target_lat, target_lon
-                        )
-                        
-                        self.logger.info(f"Moving to formation: {distance:.1f}m at {bearing:.1f}°")
-                        
-                        # Execute movement
-                        result = await loop.run_in_executor(
-                            None, self.drone_controller.fly_to_target, target_lat, target_lon, target_alt
-                        )
-                        
-                        success_msg = "SUCCESS" if result else "FAILED"
-                        self.logger.info(f"GPS formation movement: {success_msg}")
-                    else:
-                        self.logger.error("Current GPS position not available")
+                    logger.info(f"Moving to formation: {distance:.1f}m at {bearing:.1f}°")
+                    
+                    # Execute GPS movement
+                    result = await loop.run_in_executor(
+                        None, self.drone_controller.fly_to_target, target_lat, target_lon, target_alt
+                    )
+                    
+                    logger.info(f"Formation movement: {'SUCCESS' if result else 'FAILED'}")
                 else:
-                    self.logger.info(f"Leader {self.node_id} remains at center position")
+                    logger.error("Current GPS position not available")
             
             else:
-                self.logger.warning(f"Unknown command type: {cmd_type}")
-        
+                logger.warning(f"Unknown command type: {cmd_type}")
+                logger.info("Available commands: ARM, DISARM, TAKEOFF, LAND, SET_MODE, FLY_TO, FLY_TO_GPS, SET_FORMATION_GPS, EXECUTE_FORMATION, EMERGENCY_STOP, EMERGENCY_LAND")
+            
         except Exception as e:
-            self.logger.error(f"Error applying command '{command}': {e}")
+            logger.error(f"Error applying command '{command}': {e}")
 
     
     def calculate_formation_positions_leader_centered(self, formation_type: str, interval: float, angle: float = 0.0) -> List[Tuple[float, float]]:
         """
         Calculate formation positions using circular linked list for symmetric distribution
+        ENHANCED WITH DYNAMIC PEER MANAGEMENT - EXCLUDES FAILED NODES
         
         Args:
             formation_type: 'line' or 'wedge'
@@ -431,22 +467,35 @@ class RaftDroneNode:
             angle: Rotation angle of the entire formation in degrees
         
         Returns:
-            List of (x, y) relative positions for each drone
+            List of (x, y) relative positions for each ACTIVE drone
             Leader position is always (0, 0)
         """
         import math
         
-        # Create circular node list from all peers (including leader)
-        all_nodes = [(node_id, port) for node_id, port in self.peers]
-        circular_list = CircularNodeList(all_nodes)
+        # Get only active peers (excluding failed ones)
+        active_peers = self.get_active_peers()
+        failed_peers = self.health_tracker.get_failed_peers()
         
-        # Get symmetric distribution
+        # Log current peer status
+        if failed_peers:
+            logger.warning(f"Formation calculation excluding failed peers: {failed_peers}")
+        
+        logger.info(f"Formation calculation with {len(active_peers)} active nodes: {[node_id for node_id, _ in active_peers]}")
+        
+        if len(active_peers) <= 1:
+            logger.warning("Not enough active peers for formation - only leader available")
+            return [(0.0, 0.0)]  # Only leader position
+        
+        # Create circular node list with only active peers, excluding failed ones
+        circular_list = CircularNodeList(active_peers, failed_peers)
+        
+        # Get symmetric distribution around leader
         left_side, right_side = circular_list.get_symmetric_distribution(self.node_id)
         
         # Log the circular distribution
-        self.logger.info(f"Circular distribution for leader {self.node_id}:")
-        self.logger.info(f"  Left side: {[n[0] for n in left_side]}")
-        self.logger.info(f"  Right side: {[n[0] for n in right_side]}")
+        logger.info(f"Circular distribution for leader {self.node_id}:")
+        logger.info(f"  Left side: {[n[0] for n in left_side]}")
+        logger.info(f"  Right side: {[n[0] for n in right_side]}")
         
         # Create formation order: left nodes (reversed) + leader + right nodes
         formation_order = []
@@ -457,6 +506,10 @@ class RaftDroneNode:
         
         # Add leader
         leader_idx = circular_list.get_node_index(self.node_id)
+        if leader_idx == -1:
+            logger.error(f"Leader {self.node_id} not found in active peers!")
+            return [(0.0, 0.0)]
+        
         formation_order.append(circular_list.nodes[leader_idx])
         
         # Add right side nodes
@@ -467,14 +520,19 @@ class RaftDroneNode:
         positions_dict = {}
         formation_type_lower = formation_type.lower()
         
+        logger.info(f"Calculating {formation_type.upper()} formation with {interval}m interval, {angle}° rotation")
+        
         if formation_type_lower == 'line':
             # LINE FORMATION: Symmetric line with leader at center
             leader_pos_in_order = len(left_side)  # Leader is after all left nodes
+            
+            logger.info(f"LINE formation - Leader at position {leader_pos_in_order} in order of {len(formation_order)} nodes")
             
             for i, (node_id, _) in enumerate(formation_order):
                 if i == leader_pos_in_order:
                     # Leader stays at center (0, 0)
                     x, y = 0.0, 0.0
+                    role = "CENTER"
                 else:
                     # Calculate position relative to leader center
                     position_offset = i - leader_pos_in_order
@@ -487,19 +545,23 @@ class RaftDroneNode:
                     angle_rad = math.radians(angle)
                     x = x_offset * math.cos(angle_rad) - y_offset * math.sin(angle_rad)
                     y = x_offset * math.sin(angle_rad) + y_offset * math.cos(angle_rad)
+                    
+                    role = f"LEFT-{leader_pos_in_order-i}" if i < leader_pos_in_order else f"RIGHT-{i-leader_pos_in_order}"
                 
                 positions_dict[node_id] = (x, y)
-                role = "CENTER" if i == leader_pos_in_order else f"LEFT-{leader_pos_in_order-i}" if i < leader_pos_in_order else f"RIGHT-{i-leader_pos_in_order}"
-                self.logger.info(f"  {node_id} ({role}): position ({x:.1f}, {y:.1f})")
+                logger.info(f"  {node_id} ({role}): position ({x:.1f}, {y:.1f})")
         
         elif formation_type_lower == 'wedge':
             # WEDGE FORMATION: V-shape with leader at the tip (center front)
             leader_pos_in_order = len(left_side)  # Leader is after all left nodes
             
+            logger.info(f"WEDGE formation - Leader at tip position {leader_pos_in_order} in order of {len(formation_order)} nodes")
+            
             for i, (node_id, _) in enumerate(formation_order):
                 if i == leader_pos_in_order:
-                    # Leader stays at center front (0, 0)
+                    # Leader stays at center front (0, 0) - tip of the wedge
                     x, y = 0.0, 0.0
+                    role = "TIP"
                 elif i < leader_pos_in_order:
                     # Left wing of the wedge
                     level = leader_pos_in_order - i  # 1, 2, 3, ...
@@ -511,6 +573,8 @@ class RaftDroneNode:
                     x = x_offset * math.cos(angle_rad) - y_offset * math.sin(angle_rad)
                     y = x_offset * math.sin(angle_rad) + y_offset * math.cos(angle_rad)
                     
+                    role = f"LEFT-{level}"
+                    
                 else:
                     # Right wing of the wedge
                     level = i - leader_pos_in_order  # 1, 2, 3, ...
@@ -521,26 +585,38 @@ class RaftDroneNode:
                     angle_rad = math.radians(angle)
                     x = x_offset * math.cos(angle_rad) - y_offset * math.sin(angle_rad)
                     y = x_offset * math.sin(angle_rad) + y_offset * math.cos(angle_rad)
+                    
+                    role = f"RIGHT-{level}"
                 
                 positions_dict[node_id] = (x, y)
-                role = "TIP" if i == leader_pos_in_order else f"LEFT-{leader_pos_in_order-i}" if i < leader_pos_in_order else f"RIGHT-{i-leader_pos_in_order}"
-                self.logger.info(f"  {node_id} ({role}): position ({x:.1f}, {y:.1f})")
+                logger.info(f"  {node_id} ({role}): position ({x:.1f}, {y:.1f})")
         
         else:
-            self.logger.warning(f"Unsupported formation type: {formation_type}. Using line formation.")
+            logger.warning(f"Unsupported formation type: {formation_type}. Using line formation.")
             return self.calculate_formation_positions_leader_centered('line', interval, angle)
         
-        # Return positions in the same order as all_nodes (original peer order)
+        # Return positions in the same order as active_peers (original peer order, but only active ones)
         final_positions = []
-        for node_id, _ in all_nodes:
-            final_positions.append(positions_dict[node_id])
+        for node_id, _ in active_peers:
+            if node_id in positions_dict:
+                final_positions.append(positions_dict[node_id])
+            else:
+                # This shouldn't happen, but handle gracefully
+                logger.warning(f"No position calculated for active node {node_id}")
+                final_positions.append((0.0, 0.0))
+        
+        # Log summary
+        logger.info("Formation calculation complete:")
+        logger.info(f"  Total active nodes: {len(active_peers)}")
+        logger.info(f"  Excluded failed nodes: {len(failed_peers)}")
+        logger.info(f"  Positions calculated: {len(final_positions)}")
         
         return final_positions
 
     async def handle_client_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle incoming client connections"""
         client_addr = writer.get_extra_info('peername')
-        self.logger.debug(f"New connection from {client_addr}")
+        logger.debug(f"New connection from {client_addr}")
         
         try:
             while True:
@@ -550,7 +626,7 @@ class RaftDroneNode:
                 
                 await self.process_message(message, reader, writer)
         except Exception as e:
-            self.logger.debug(f"Connection error with {client_addr}: {e}")
+            logger.debug(f"Connection error with {client_addr}: {e}")
         finally:
             writer.close()
             await writer.wait_closed()
@@ -579,7 +655,7 @@ class RaftDroneNode:
                         if hasattr(entry_data, '__dict__'):
                             entries.append(LogEntry(**asdict(entry_data)))
                         else:
-                            self.logger.error(f"Invalid entry data: {entry_data}")
+                            logger.error(f"Invalid entry data: {entry_data}")
                             continue
                 
                 # Create a copy of message data with converted entries
@@ -623,7 +699,7 @@ class RaftDroneNode:
                 await SocketProtocol.send_message(writer, response_msg)
         
         except Exception as e:
-            self.logger.error(f"Error processing message: {e}")
+            logger.error(f"Error processing message: {e}")
     
     async def handle_swarm_command(self, command_data: Dict) -> Dict:
         """Handle swarm coordination commands"""
@@ -667,7 +743,7 @@ class RaftDroneNode:
                 return {'error': f'Unknown swarm command: {swarm_cmd.command_type}'}
         
         except Exception as e:
-            self.logger.error(f"Error handling swarm command: {e}")
+            logger.error(f"Error handling swarm command: {e}")
             return {'error': str(e)}
     
     async def execute_connect_all(self) -> Dict:
@@ -705,12 +781,30 @@ class RaftDroneNode:
     async def execute_set_formation(self, parameters: Dict) -> Dict:
         """
         Set formation for the swarm using circular distribution - LEADER-CENTERED VERSION
-        Leader stays at current position, others move relative to leader's GPS coordinates
+        NOW WITH DYNAMIC PEER MANAGEMENT
         """
         formation_type = parameters.get('formation_type')
         interval = parameters.get('interval', 10.0)
         angle = parameters.get('angle', 0.0)
         execute_immediately = parameters.get('execute', False)
+        
+        # Store formation config for potential recalculation
+        self.last_formation_config = parameters.copy()
+        self.last_formation_time = time.time()
+        
+        # Get only active peers
+        active_peers = self.get_active_peers()
+        failed_peers = self.health_tracker.get_failed_peers()
+        
+        if failed_peers:
+            logger.warning(f"Formation excludes failed nodes: {failed_peers}")
+        
+        if len(active_peers) <= 1:
+            return {
+                'error': 'Not enough active nodes for formation',
+                'active_nodes': len(active_peers),
+                'failed_nodes': list(failed_peers)
+            }
         
         # Get leader's current GPS position
         leader_status = self.get_drone_status()
@@ -722,25 +816,21 @@ class RaftDroneNode:
         leader_lat, leader_lon = leader_position
         leader_alt = leader_status.get('altitude', 0)
         
-        self.logger.info(f"Leader {self.node_id} GPS: {leader_lat:.6f}, {leader_lon:.6f}, {leader_alt:.1f}m")
+        logger.info(f"Setting formation with {len(active_peers)} active nodes:")
+        logger.info(f"Leader {self.node_id} GPS: {leader_lat:.6f}, {leader_lon:.6f}, {leader_alt:.1f}m")
+        logger.info(f"Formation: {formation_type.upper()} with {interval}m spacing")
+        if failed_peers:
+            logger.info(f"Excluded failed nodes: {failed_peers}")
         
-        # Create circular node list and log distribution
-        all_nodes = [(node_id, port) for node_id, port in self.peers]
-        circular_list = CircularNodeList(all_nodes)
-        left_side, right_side = circular_list.get_symmetric_distribution(self.node_id)
-        
-        self.logger.info(f"Formation: {formation_type.upper()} with {interval}m spacing")
-        self.logger.info(f"Circular distribution - Left: {[n[0] for n in left_side]}, Right: {[n[0] for n in right_side]}")
-        
-        # Calculate formation positions using circular method
+        # Calculate formation positions using only active nodes
         relative_positions = self.calculate_formation_positions_leader_centered(
             formation_type, interval, angle
         )
         
-        # Convert relative positions to GPS coordinates
+        # Convert relative positions to GPS coordinates for active nodes only
         formation_assignment = {}
         
-        for i, (node_id, _) in enumerate(all_nodes):
+        for i, (node_id, _) in enumerate(active_peers):
             if node_id == self.node_id:
                 # Leader stays at current position
                 formation_assignment[node_id] = {
@@ -752,7 +842,7 @@ class RaftDroneNode:
                     'is_leader': True
                 }
             elif i < len(relative_positions):
-                # Calculate GPS coordinates for follower drones
+                # Calculate GPS coordinates for active follower drones
                 rel_x, rel_y = relative_positions[i]
                 target_lat, target_lon = Calculator.relative_to_gps(leader_lat, leader_lon, rel_x, rel_y)
                 
@@ -760,43 +850,40 @@ class RaftDroneNode:
                     'type': 'follower_relative',
                     'lat': target_lat,
                     'lon': target_lon,
-                    'alt': leader_alt,  # Same altitude as leader
+                    'alt': leader_alt,
                     'relative_pos': (rel_x, rel_y),
                     'is_leader': False
                 }
         
-        # Send formation command with GPS coordinates
+        # Send formation command with GPS coordinates (only to active nodes)
         command = f"SET_FORMATION_GPS:{json.dumps({
             'formation_type': formation_type,
             'leader_id': self.node_id,
             'leader_gps': {'lat': leader_lat, 'lon': leader_lon, 'alt': leader_alt},
             'assignments': formation_assignment,
-            'circular_distribution': {
-                'left_side': [n[0] for n in left_side],
-                'right_side': [n[0] for n in right_side]
-            }
+            'active_nodes': [node_id for node_id, _ in active_peers],
+            'excluded_failed_nodes': list(failed_peers),
+            'recalculation_time': time.time()
         })}"
         
         success = await self.replicate_command(command)
         
         result = {
             'success': success,
-            'command': 'SET_FORMATION_GPS_CIRCULAR',
+            'command': 'SET_FORMATION_GPS_DYNAMIC',
             'formation_type': formation_type,
             'leader_id': self.node_id,
             'leader_position': {'lat': leader_lat, 'lon': leader_lon, 'alt': leader_alt},
             'positions_set': len(formation_assignment) if success else 0,
+            'active_nodes': len(active_peers),
+            'excluded_failed_nodes': list(failed_peers),
             'interval': interval,
-            'angle': angle,
-            'circular_distribution': {
-                'left_side': [n[0] for n in left_side],
-                'right_side': [n[0] for n in right_side]
-            }
+            'angle': angle
         }
         
         # If execute immediately is requested
         if execute_immediately and success:
-            await asyncio.sleep(1)  # Small delay to ensure SET_FORMATION is applied
+            await asyncio.sleep(1)
             execute_result = await self.execute_formation_movement_gps()
             result['movement_executed'] = execute_result['success']
             result['moved_nodes'] = execute_result.get('moved_nodes', 0)
@@ -891,12 +978,12 @@ class RaftDroneNode:
         if success_count >= majority:
             # Commit the entry
             self.commit_index = log_entry.index
-            self.logger.info(f"Command committed: {command}")
+            logger.info(f"Command committed: {command}")
             return True
         else:
             # Remove the entry if not committed
             self.log.pop()
-            self.logger.warning(f"Command failed to replicate: {command}")
+            logger.warning(f"Command failed to replicate: {command}")
             return False
     
     async def send_append_entries_with_entry(self, peer_id: str, peer_port: int, entry: LogEntry) -> Optional[AppendEntriesResponse]:
@@ -930,31 +1017,36 @@ class RaftDroneNode:
                 return AppendEntriesResponse(**response_msg.data)
         
         except Exception as e:
-            self.logger.debug(f"Failed to send append entries to {peer_id}: {e}")
+            logger.debug(f"Failed to send append entries to {peer_id}: {e}")
         
         return None
     
     async def send_message_to_peer(self, peer_id: str, peer_port: int, message: Message) -> Optional[Message]:
-        """Send message to a peer and wait for response"""
+        """Send message to a peer and wait for response - WITH HEALTH TRACKING"""
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection('localhost', peer_port),
-                timeout=1.0
+                timeout=2.0  # Increased timeout
             )
             
             try:
                 await SocketProtocol.send_message(writer, message)
                 response = await asyncio.wait_for(
                     SocketProtocol.receive_message(reader),
-                    timeout=1.0
+                    timeout=2.0
                 )
+                # Mark successful communication
+                if response:
+                    self.handle_successful_peer_communication(peer_id)
                 return response
             finally:
                 writer.close()
                 await writer.wait_closed()
         
         except Exception as e:
-            self.logger.debug(f"Failed to send message to {peer_id}: {e}")
+            logger.debug(f"Failed to send message to {peer_id}: {e}")
+            # Mark communication failure
+            self.handle_peer_communication_failure(peer_id)
             return None
     
     async def election_timer(self):
@@ -968,11 +1060,11 @@ class RaftDroneNode:
                     if time_since_heartbeat > self.election_timeout:
                         await self.start_election()
             except Exception as e:
-                self.logger.error(f"Error in election timer: {e}")
+                logger.error(f"Error in election timer: {e}")
     
     async def start_election(self):
         """Start a new election"""
-        self.logger.info(f"Starting election for term {self.current_term + 1}")
+        logger.info(f"Starting election for term {self.current_term + 1}")
         
         self.state = NodeState.CANDIDATE
         self.current_term += 1
@@ -1003,7 +1095,7 @@ class RaftDroneNode:
         if self.state == NodeState.CANDIDATE and votes_received >= votes_needed:
             await self.become_leader()
         else:
-            self.logger.info(f"Election failed. Got {votes_received}/{votes_needed} votes")
+            logger.info(f"Election failed. Got {votes_received}/{votes_needed} votes")
             self.state = NodeState.FOLLOWER
     
     async def request_vote_from_peer(self, peer_id: str, peer_port: int) -> Optional[VoteResponse]:
@@ -1030,13 +1122,13 @@ class RaftDroneNode:
                 return VoteResponse(**response_msg.data)
         
         except Exception as e:
-            self.logger.debug(f"Failed to request vote from {peer_id}: {e}")
+            logger.debug(f"Failed to request vote from {peer_id}: {e}")
         
         return None
     
     async def become_leader(self):
         """Become the leader"""
-        self.logger.info(f"Became leader for term {self.current_term}")
+        logger.info(f"Became leader for term {self.current_term}")
         self.state = NodeState.LEADER
         
         for peer_id, _ in self.peers:
@@ -1063,7 +1155,7 @@ class RaftDroneNode:
                 
                 await asyncio.sleep(self.heartbeat_interval)
             except Exception as e:
-                self.logger.error(f"Error sending heartbeats: {e}")
+                logger.error(f"Error sending heartbeats: {e}")
     
     async def send_append_entries(self, peer_id: str, peer_port: int):
         """Send append entries (heartbeat) to a peer"""
@@ -1099,6 +1191,9 @@ class RaftDroneNode:
             
             response_msg = await self.send_message_to_peer(peer_id, peer_port, message)
             if response_msg and response_msg.msg_type == MessageType.APPEND_RESPONSE.value:
+                # Mark successful communication
+                self.handle_successful_peer_communication(peer_id)
+                
                 append_response = AppendEntriesResponse(**response_msg.data)
                 
                 if append_response.success:
@@ -1113,13 +1208,18 @@ class RaftDroneNode:
                 
                 if append_response.term > self.current_term:
                     await self.step_down(append_response.term)
+            else:
+                # Mark communication failure
+                self.handle_peer_communication_failure(peer_id)
         
         except Exception as e:
-            self.logger.debug(f"Failed to send heartbeat to {peer_id}: {e}")
+            logger.debug(f"Failed to send heartbeat to {peer_id}: {e}")
+            # Mark communication failure
+            self.handle_peer_communication_failure(peer_id)
     
     async def step_down(self, new_term: int):
         """Step down from leadership and update term"""
-        self.logger.info(f"Stepping down. New term: {new_term}")
+        logger.info(f"Stepping down. New term: {new_term}")
         self.current_term = new_term
         self.voted_for = None
         self.state = NodeState.FOLLOWER
@@ -1151,7 +1251,7 @@ class RaftDroneNode:
                 self.voted_for = vote_request.candidate_id
                 self.last_heartbeat = time.time()
         
-        self.logger.debug(f"Vote request from {vote_request.candidate_id}: granted={vote_granted}")
+        logger.debug(f"Vote request from {vote_request.candidate_id}: granted={vote_granted}")
         return VoteResponse(term=self.current_term, vote_granted=vote_granted)
     
     async def handle_append_entries(self, append_request: AppendEntriesRequest) -> AppendEntriesResponse:
@@ -1194,17 +1294,17 @@ class RaftDroneNode:
                             entry = entry_data
                         
                         self.log.append(entry)
-                        self.logger.debug(f"Appended log entry: {entry.command}")
+                        logger.debug(f"Appended log entry: {entry.command}")
                 
                 # Update commit index
                 if append_request.leader_commit > self.commit_index:
                     self.commit_index = min(append_request.leader_commit, len(self.log) - 1)
-                    self.logger.debug(f"Updated commit index to: {self.commit_index}")
+                    logger.debug(f"Updated commit index to: {self.commit_index}")
             
             else:
-                self.logger.debug(f"Log consistency check failed. prev_log_index: {append_request.prev_log_index}, log_length: {len(self.log)}")
+                logger.debug(f"Log consistency check failed. prev_log_index: {append_request.prev_log_index}, log_length: {len(self.log)}")
             
-            self.logger.debug(f"Append entries from leader {append_request.leader_id}: success={success}, entries={len(append_request.entries)}")
+            logger.debug(f"Append entries from leader {append_request.leader_id}: success={success}, entries={len(append_request.entries)}")
         
         return AppendEntriesResponse(term=self.current_term, success=success)
     
@@ -1222,8 +1322,12 @@ class RaftDroneNode:
             return {'error': 'Failed to replicate command'}
     
     async def handle_status_request(self) -> Dict:
-        """Handle status request"""
+        """Handle status request - WITH FORMATION AND HEALTH INFO"""
         drone_status = self.get_drone_status() if self.drone_connected else None
+        
+        # Get peer health info
+        active_peers = self.get_active_peers()
+        failed_peers = self.health_tracker.get_failed_peers()
         
         return {
             'node_id': self.node_id,
@@ -1236,7 +1340,17 @@ class RaftDroneNode:
             'drone_index': self.drone_index,
             'drone_connected': self.drone_connected,
             'drone_status': drone_status,
-            'swarm_state': self.swarm_state
+            'swarm_state': self.swarm_state,
+            'peer_health': {
+                'active_peers': [node_id for node_id, _ in active_peers],
+                'failed_peers': list(failed_peers),
+                'total_peers': len(self.peers),
+                'active_count': len(active_peers)
+            },
+            'formation_state': {
+                'last_config': self.last_formation_config,
+                'last_calculation_time': self.last_formation_time
+            }
         }
     
     async def stop(self):
@@ -1288,7 +1402,7 @@ class RaftDroneClient:
                 await writer.wait_closed()
         
         except Exception as e:
-            logging.error(f"Swarm command failed: {e}")
+            logger.error(f"Swarm command failed: {e}")
         
         return None
     
@@ -1314,7 +1428,7 @@ class RaftDroneClient:
                 await writer.wait_closed()
         
         except Exception as e:
-            logging.debug(f"Status request failed: {e}")
+            logger.debug(f"Status request failed: {e}")
         
         return None
     

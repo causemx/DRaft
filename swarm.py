@@ -152,7 +152,7 @@ async def status():
             try:
                 node_id = swarm_cli.config_manager.get_node_id_by_port(port)
                 click.echo(f"         {node_id:<8} | Port {port} | OFFLINE   | ---   | ---")
-            except:
+            except Exception:
                 click.echo(f"         Node{port}    | Port {port} | OFFLINE   | ---   | ---")
     
     click.echo("="*80)
@@ -501,7 +501,7 @@ async def preview_gps(formation_type, interval, angle):
         click.echo("ERROR: Cannot determine leader index")
         return
     
-    num_drones = len(all_nodes)
+    _num_drones = len(all_nodes)
     
     for i, (node_name, _, _) in enumerate(all_nodes):
         if i == leader_index:
@@ -643,7 +643,7 @@ async def raw(command):
             if response and response.msg_type == MessageType.CLIENT_RESPONSE.value:
                 result = response.data
                 if result.get('success'):
-                    click.echo(f"SUCCESS: Command executed successfully")
+                    click.echo("SUCCESS: Command executed successfully")
                     click.echo(f"   Index: {result.get('index')}")
                 else:
                     click.echo(f"ERROR: Command failed: {result.get('error')}")

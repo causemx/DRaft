@@ -1,6 +1,6 @@
 import click
 import time
-from libs.utils import DroneController, FlightMode
+from libs.control import DroneController, FlightMode
 
 # Global drone controller instance
 drone_controller = None

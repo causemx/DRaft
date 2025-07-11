@@ -114,7 +114,7 @@ class DroneController:
                 msg = self.drone.recv_match(blocking=True, timeout=1.0)
                 if msg:
                     msg_type = msg.get_type()
-                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    _timestamp = datetime.now().strftime("%H:%M:%S")
 
                     # Process different message types
                     if msg_type == 'HEARTBEAT':
