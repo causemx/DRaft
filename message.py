@@ -4,6 +4,15 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 
+class MessageTranslator:
+    """
+    TODO
+    MessageTranslator.py provides utility functions to translate
+    messages between the JSON that they are transmitted as over the network
+    and Message objects
+    """
+
+
 class NodeState(Enum):
     FOLLOWER = "follower"
     CANDIDATE = "candidate"
