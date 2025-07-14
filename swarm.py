@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Swarm Control CLI - Command line interface for controlling the Raft-Drone swarm
-Enhanced with leader-centered formation system
+Enhanced with leader-centered formation system and NodeMetadata support
 """
 
 import asyncio
@@ -13,40 +13,41 @@ from typing import Optional, Dict, List
 try:
     from raft_node import RaftDroneClient, SwarmCommandType, SocketProtocol, Message, MessageType
     from config_manager import get_config_manager
+    from node_metadata import NodeMetadata
 except ImportError:
     print("Error: Cannot import required modules")
-    print("Make sure raft_node.py and config_manager.py are in the same directory")
+    print("Make sure raft_node.py, config_manager.py, and node_metadata.py are in the same directory")
     exit(1)
 
 class SwarmCLI:
-    def __init__(self):
+    def __init__(self, host: str = 'localhost'):
         # Load configuration
         self.config_manager = get_config_manager()
+        self.host = host
         self.cluster_ports = self.config_manager.get_all_ports()
+        self.cluster_nodes = [NodeMetadata(host, port) for port in self.cluster_ports]
         self.current_leader = None
-        self.current_leader_port = None
         
         print(f"Loaded cluster configuration: {self.config_manager.get_drone_count()} nodes")
-        print(f"Cluster ports: {self.cluster_ports}")
+        print(f"Cluster nodes: {[f'{host}:{port}' for port in self.cluster_ports]}")
     
     async def find_leader(self) -> bool:
         """Find the current leader in the cluster"""
-        leader_info = await RaftDroneClient.find_leader(self.cluster_ports)
-        if leader_info:
-            self.current_leader, self.current_leader_port = leader_info
+        leader_node = await RaftDroneClient.find_leader(self.cluster_nodes)
+        if leader_node:
+            self.current_leader = leader_node
             return True
         return False
     
     async def send_command(self, command_type: str, parameters: Dict = None) -> Optional[Dict]:
         """Send command to the leader"""
-        if not self.current_leader_port:
+        if not self.current_leader:
             if not await self.find_leader():
                 click.echo("ERROR: No leader found in cluster")
                 return None
         
         result = await RaftDroneClient.send_swarm_command(
-            'localhost', 
-            self.current_leader_port, 
+            self.current_leader, 
             command_type, 
             parameters or {}
         )
@@ -55,8 +56,7 @@ class SwarmCLI:
         if result and result.get('error') == 'Not leader':
             if await self.find_leader():
                 result = await RaftDroneClient.send_swarm_command(
-                    'localhost', 
-                    self.current_leader_port, 
+                    self.current_leader, 
                     command_type, 
                     parameters or {}
                 )
@@ -66,19 +66,21 @@ class SwarmCLI:
     async def get_cluster_status(self) -> List[Dict]:
         """Get status of all nodes in the cluster"""
         statuses = []
-        for port in self.cluster_ports:
-            status = await RaftDroneClient.get_node_status('localhost', port)
+        for node_metadata in self.cluster_nodes:
+            status = await RaftDroneClient.get_node_status(node_metadata)
             statuses.append({
-                'port': port,
+                'node_metadata': node_metadata,
                 'status': status
             })
         return statuses
 
 # Create global CLI instance
-swarm_cli = SwarmCLI()
+swarm_cli = None
 
 @click.group()
-def cli():
+@click.option('--host', default='localhost', help='Host address for cluster nodes')
+@click.pass_context
+def cli(ctx, host):
     """Raft-Drone Swarm Control CLI
     
     Control a distributed drone swarm using Raft consensus algorithm.
@@ -87,7 +89,10 @@ def cli():
     
     Configuration is loaded from config.ini file.
     """
-    pass
+    global swarm_cli
+    swarm_cli = SwarmCLI(host)
+    ctx.ensure_object(dict)
+    ctx.obj['host'] = host
 
 @cli.command()
 async def config():
@@ -97,13 +102,14 @@ async def config():
     
     try:
         all_nodes = swarm_cli.config_manager.get_all_nodes()
-        click.echo(f"{'Node ID':<10} {'Port':<6} {'Drone Connection':<25}")
-        click.echo("-" * 50)
+        click.echo(f"{'Node ID':<10} {'Host:Port':<15} {'Drone Connection':<25}")
+        click.echo("-" * 60)
         
         for node_id, port, connection in all_nodes:
-            click.echo(f"{node_id:<10} {port:<6} {connection:<25}")
+            click.echo(f"{node_id:<10} {swarm_cli.host}:{port:<10} {connection:<25}")
         
         click.echo(f"\nTotal nodes: {len(all_nodes)}")
+        click.echo(f"Host: {swarm_cli.host}")
         
     except Exception as e:
         click.echo(f"Error reading configuration: {e}")
@@ -119,13 +125,14 @@ async def status():
     leader_node = None
     online_nodes = 0
     
-    click.echo("\n" + "="*80)
+    click.echo("\n" + "="*90)
     click.echo("                        RAFT-DRONE CLUSTER STATUS")
-    click.echo("="*80)
+    click.echo("="*90)
     
     for node_info in cluster_status:
-        port = node_info['port']
+        node_metadata = node_info['node_metadata']
         status = node_info['status']
+        host_port = f"{node_metadata.get_host()}:{node_metadata.get_port()}"
         
         if status:
             online_nodes += 1
@@ -136,9 +143,9 @@ async def status():
             
             if state == 'LEADER':
                 leader_node = node_id
-                click.echo(f"[LEADER] {node_id:<8} | Port {port} | {state:<9} | Term {term:<3} | Drone {drone_connected}")
+                click.echo(f"[LEADER] {node_id:<8} | {host_port:<15} | {state:<9} | Term {term:<3} | Drone {drone_connected}")
             else:
-                click.echo(f"         {node_id:<8} | Port {port} | {state:<9} | Term {term:<3} | Drone {drone_connected}")
+                click.echo(f"         {node_id:<8} | {host_port:<15} | {state:<9} | Term {term:<3} | Drone {drone_connected}")
             
             # Show drone status if connected
             drone_status = status.get('drone_status')
@@ -150,15 +157,18 @@ async def status():
         else:
             # Get node ID from port using config
             try:
-                node_id = swarm_cli.config_manager.get_node_id_by_port(port)
-                click.echo(f"         {node_id:<8} | Port {port} | OFFLINE   | ---   | ---")
+                node_id = swarm_cli.config_manager.get_node_id_by_port(node_metadata.get_port())
+                click.echo(f"         {node_id:<8} | {host_port:<15} | OFFLINE   | ---   | ---")
             except Exception:
-                click.echo(f"         Node{port}    | Port {port} | OFFLINE   | ---   | ---")
+                click.echo(f"         Node{node_metadata.get_port()}    | {host_port:<15} | OFFLINE   | ---   | ---")
     
-    click.echo("="*80)
-    click.echo(f"Cluster: {online_nodes}/{len(swarm_cli.cluster_ports)} nodes online")
+    click.echo("="*90)
+    click.echo(f"Cluster: {online_nodes}/{len(swarm_cli.cluster_nodes)} nodes online")
     if leader_node:
         click.echo(f"Leader: {leader_node}")
+        if swarm_cli.current_leader:
+            leader_addr = f"{swarm_cli.current_leader.get_host()}:{swarm_cli.current_leader.get_port()}"
+            click.echo(f"Leader Address: {leader_addr}")
     else:
         click.echo("Leader: None (election in progress)")
     click.echo()
@@ -394,8 +404,9 @@ async def formation_status():
     leader_found = False
     
     for node_info in cluster_status:
-        port = node_info['port']
+        node_metadata = node_info['node_metadata']
         status = node_info['status']
+        host_port = f"{node_metadata.get_host()}:{node_metadata.get_port()}"
         
         if status:
             node_id = status['node_id']
@@ -409,9 +420,9 @@ async def formation_status():
             
             if state == 'leader':
                 leader_found = True
-                click.echo(f"LEADER  {node_id:<8} | Port {port} | GPS: {current_pos[0]:.6f}, {current_pos[1]:.6f} | Alt: {current_alt:.1f}m" if current_pos else f"LEADER  {node_id:<8} | Port {port} | GPS: Not available")
+                click.echo(f"LEADER  {node_id:<8} | {host_port:<15} | GPS: {current_pos[0]:.6f}, {current_pos[1]:.6f} | Alt: {current_alt:.1f}m" if current_pos else f"LEADER  {node_id:<8} | {host_port:<15} | GPS: Not available")
             else:
-                click.echo(f"FOLLOWER {node_id:<8} | Port {port} | GPS: {current_pos[0]:.6f}, {current_pos[1]:.6f} | Alt: {current_alt:.1f}m" if current_pos else f"FOLLOWER {node_id:<8} | Port {port} | GPS: Not available")
+                click.echo(f"FOLLOWER {node_id:<8} | {host_port:<15} | GPS: {current_pos[0]:.6f}, {current_pos[1]:.6f} | Alt: {current_alt:.1f}m" if current_pos else f"FOLLOWER {node_id:<8} | {host_port:<15} | GPS: Not available")
             
             # Show formation assignment
             target_gps = swarm_state.get('target_gps')
@@ -426,10 +437,10 @@ async def formation_status():
                     click.echo(f"     Relative: {rel_pos[0]:+.1f}m East, {rel_pos[1]:+.1f}m North")
         else:
             try:
-                node_id = swarm_cli.config_manager.get_node_id_by_port(port)
-                click.echo(f"OFFLINE  {node_id:<8} | Port {port} | Status: Disconnected")
+                node_id = swarm_cli.config_manager.get_node_id_by_port(node_metadata.get_port())
+                click.echo(f"OFFLINE  {node_id:<8} | {host_port:<15} | Status: Disconnected")
             except Exception:
-                click.echo(f"OFFLINE  Node{port}    | Port {port} | Status: Disconnected")
+                click.echo(f"OFFLINE  Node{node_metadata.get_port()}    | {host_port:<15} | Status: Disconnected")
     
     click.echo("="*90)
     if leader_found:
@@ -460,7 +471,7 @@ async def preview_gps(formation_type, interval, angle):
         return
     
     # Get leader status
-    leader_status = await RaftDroneClient.get_node_status('localhost', swarm_cli.current_leader_port)
+    leader_status = await RaftDroneClient.get_node_status(swarm_cli.current_leader)
     if not leader_status:
         click.echo("ERROR: Cannot get leader status")
         return
@@ -596,11 +607,13 @@ async def leader():
     click.echo("Finding cluster leader...")
     
     if await swarm_cli.find_leader():
-        click.echo(f"SUCCESS: Current leader: {swarm_cli.current_leader} on port {swarm_cli.current_leader_port}")
+        leader_addr = f"{swarm_cli.current_leader.get_host()}:{swarm_cli.current_leader.get_port()}"
+        click.echo(f"SUCCESS: Current leader at {leader_addr}")
         
         # Get detailed status of leader
-        status = await RaftDroneClient.get_node_status('localhost', swarm_cli.current_leader_port)
+        status = await RaftDroneClient.get_node_status(swarm_cli.current_leader)
         if status:
+            click.echo(f"   Node ID: {status.get('node_id')}")
             click.echo(f"   Term: {status.get('term')}")
             click.echo(f"   Log entries: {status.get('log_length', 0)}")
             click.echo(f"   Committed: {status.get('commit_index', 0)}")
@@ -623,21 +636,26 @@ async def raw(command):
     click.echo(f"Sending raw command: {command}")
     
     # Send as a client request (not swarm command)
-    if not swarm_cli.current_leader_port:
+    if not swarm_cli.current_leader:
         if not await swarm_cli.find_leader():
             click.echo("ERROR: No leader found")
             return
     
     try:
-        message = {
-            'msg_type': MessageType.CLIENT_REQUEST.value,
-            'data': {'command': command},
-            'sender_id': 'cli'
-        }
+        client_metadata = NodeMetadata('client', 0)
         
-        reader, writer = await asyncio.open_connection('localhost', swarm_cli.current_leader_port)
+        message = Message(
+            msg_type=MessageType.CLIENT_REQUEST.value,
+            data={'command': command},
+            sender=client_metadata
+        )
+        
+        reader, writer = await asyncio.open_connection(
+            swarm_cli.current_leader.get_host(), 
+            swarm_cli.current_leader.get_port()
+        )
         try:
-            await SocketProtocol.send_message(writer, Message(**message))
+            await SocketProtocol.send_message(writer, message)
             response = await SocketProtocol.receive_message(reader)
             
             if response and response.msg_type == MessageType.CLIENT_RESPONSE.value:
@@ -666,13 +684,14 @@ async def logs(output_format):
     logs_data = {}
     
     for node_info in cluster_status:
-        port = node_info['port']
+        node_metadata = node_info['node_metadata']
         status = node_info['status']
         
         if status:
             node_id = status['node_id']
+            host_port = f"{node_metadata.get_host()}:{node_metadata.get_port()}"
             logs_data[node_id] = {
-                'port': port,
+                'address': host_port,
                 'state': status['state'],
                 'term': status['term'],
                 'log_length': status.get('log_length', 0),
@@ -682,14 +701,14 @@ async def logs(output_format):
     if output_format == 'json':
         click.echo(json.dumps(logs_data, indent=2))
     else:
-        click.echo("\n" + "="*70)
+        click.echo("\n" + "="*80)
         click.echo("                          CLUSTER LOGS")
-        click.echo("="*70)
-        click.echo(f"{'Node':<8} {'Port':<6} {'State':<9} {'Term':<6} {'Log Len':<8} {'Committed':<10}")
-        click.echo("-"*70)
+        click.echo("="*80)
+        click.echo(f"{'Node':<8} {'Address':<15} {'State':<9} {'Term':<6} {'Log Len':<8} {'Committed':<10}")
+        click.echo("-"*80)
         
         for node_id, data in logs_data.items():
-            click.echo(f"{node_id:<8} {data['port']:<6} {data['state']:<9} {data['term']:<6} {data['log_length']:<8} {data['commit_index']:<10}")
+            click.echo(f"{node_id:<8} {data['address']:<15} {data['state']:<9} {data['term']:<6} {data['log_length']:<8} {data['commit_index']:<10}")
 
 @cli.command()
 async def health():
@@ -744,7 +763,6 @@ async def health():
     else:
         click.echo("ERROR: Cluster is unhealthy - operations not recommended")
 
-
 @cli.command()
 async def formation_help():
     """Show detailed help about formation systems"""
@@ -758,27 +776,7 @@ Both formations keep the leader at the center/tip position.
 FORMATION TYPES:
 
 1. LINE FORMATION:
-   • All drones arranged in a straight line
-   • Leader stays at center of the line
-   • Equal spacing between adjacent drones
-   • Symmetric distribution around leader
-
-   Example (5 drones, 10m spacing):
-   drone1 ---- drone2 ---- LEADER ---- drone4 ---- drone5
-   (-20,0)    (-10,0)       (0,0)      (10,0)     (20,0)
-
 2. WEDGE FORMATION:
-   • V-shaped arrangement with leader at tip
-   • Leader stays at front center (tip of V)
-   • Drones form symmetric wings behind leader
-   • Diagonal spacing creates V-shape
-
-   Example (5 drones, 10m spacing):
-                    LEADER (0,0)
-                   /          \\
-           drone2(-10,-10)   drone4(10,-10)
-          /                              \\
-   drone1(-20,-20)                  drone5(20,-20)
 
 LEADER-CENTERED CONCEPT:
 • Current Raft leader becomes formation reference point
@@ -817,12 +815,222 @@ WEDGE FORMATION DETAILS:
 • Spacing determines both horizontal and vertical separation
 • Perfect for tactical formations and wind management
 
+DISTRIBUTED DEPLOYMENT:
+• Supports multiple hosts with --host option
+• Example: swarm.py --host 192.168.1.100 status
+• Each node can run on different machines
+• Full host:port addressing for network flexibility
+
 CONFIGURATION:
 • Drone connections and ports loaded from config.ini
 • Each drone has its own connection string and node port
 • View configuration with 'config' command
     """
     click.echo(help_text)
+
+@cli.command()
+@click.option('--nodes', '-n', multiple=True, help='Specific node addresses (host:port) to ping')
+async def ping(nodes):
+    """Ping cluster nodes to test connectivity
+    
+    Examples:
+        ping                                    # Ping all configured nodes
+        ping -n localhost:8001 -n 192.168.1.100:8002  # Ping specific nodes
+    """
+    click.echo("Pinging cluster nodes...")
+    
+    # Determine which nodes to ping
+    if nodes:
+        # Parse specific nodes
+        target_nodes = []
+        for node_addr in nodes:
+            try:
+                host, port = node_addr.split(':')
+                target_nodes.append(NodeMetadata(host, int(port)))
+            except ValueError:
+                click.echo(f"ERROR: Invalid node address format: {node_addr} (expected host:port)")
+                return
+    else:
+        # Use all configured nodes
+        target_nodes = swarm_cli.cluster_nodes
+    
+    click.echo(f"Testing connectivity to {len(target_nodes)} nodes...")
+    click.echo("-" * 60)
+    
+    # Test each node
+    successful_pings = 0
+    for node_metadata in target_nodes:
+        host_port = f"{node_metadata.get_host()}:{node_metadata.get_port()}"
+        
+        try:
+            # Try to connect and get status
+            start_time = asyncio.get_event_loop().time()
+            status = await RaftDroneClient.get_node_status(node_metadata)
+            end_time = asyncio.get_event_loop().time()
+            
+            if status:
+                response_time = (end_time - start_time) * 1000  # Convert to ms
+                node_id = status.get('node_id', 'unknown')
+                state = status.get('state', 'unknown')
+                click.echo(f"✓ {host_port:<20} | {node_id:<8} | {state:<9} | {response_time:.1f}ms")
+                successful_pings += 1
+            else:
+                click.echo(f"✗ {host_port:<20} | No response")
+        
+        except Exception as e:
+            click.echo(f"✗ {host_port:<20} | Connection failed: {str(e)[:30]}...")
+    
+    click.echo("-" * 60)
+    click.echo(f"Connectivity: {successful_pings}/{len(target_nodes)} nodes reachable")
+    
+    if successful_pings == len(target_nodes):
+        click.echo("SUCCESS: All nodes are reachable")
+    elif successful_pings >= len(target_nodes) // 2 + 1:
+        click.echo("WARNING: Majority of nodes reachable, cluster should be operational")
+    else:
+        click.echo("ERROR: Majority of nodes unreachable, cluster may be down")
+
+@cli.command()
+@click.option('--interval', '-i', default=5, help='Update interval in seconds')
+@click.option('--count', '-c', default=0, help='Number of updates (0 = infinite)')
+async def network_monitor(interval, count):
+    """Monitor network connectivity to all cluster nodes
+    
+    Continuously monitors the health of network connections to all nodes
+    in the cluster. Shows response times and connection status.
+    """
+    click.echo("Starting network connectivity monitor...")
+    click.echo(f"Update interval: {interval}s")
+    click.echo(f"Monitoring {len(swarm_cli.cluster_nodes)} nodes")
+    click.echo("Press Ctrl+C to stop\n")
+    
+    update_counter = 0
+    
+    try:
+        while count == 0 or update_counter < count:
+            # Clear screen and show header
+            if update_counter > 0:
+                click.clear()
+            
+            click.echo(f"Network Monitor - Update #{update_counter + 1}")
+            click.echo(f"Timestamp: {asyncio.get_event_loop().time():.0f}")
+            click.echo("=" * 70)
+            click.echo(f"{'Address':<20} | {'Node ID':<8} | {'State':<9} | {'Response':<10}")
+            click.echo("-" * 70)
+            
+            # Test all nodes
+            successful_connections = 0
+            total_response_time = 0
+            
+            for node_metadata in swarm_cli.cluster_nodes:
+                host_port = f"{node_metadata.get_host()}:{node_metadata.get_port()}"
+                
+                try:
+                    start_time = asyncio.get_event_loop().time()
+                    status = await RaftDroneClient.get_node_status(node_metadata)
+                    end_time = asyncio.get_event_loop().time()
+                    
+                    if status:
+                        response_time = (end_time - start_time) * 1000
+                        total_response_time += response_time
+                        node_id = status.get('node_id', 'unknown')
+                        state = status.get('state', 'unknown')
+                        click.echo(f"{host_port:<20} | {node_id:<8} | {state:<9} | {response_time:.1f}ms")
+                        successful_connections += 1
+                    else:
+                        click.echo(f"{host_port:<20} | {'ERROR':<8} | {'NO_RESP':<9} | {'TIMEOUT':<10}")
+                
+                except Exception as e:
+                    error_msg = str(e)[:8] if len(str(e)) > 8 else str(e)
+                    click.echo(f"{host_port:<20} | {'ERROR':<8} | {'FAILED':<9} | {error_msg:<10}")
+            
+            # Summary
+            click.echo("-" * 70)
+            avg_response = total_response_time / successful_connections if successful_connections > 0 else 0
+            click.echo(f"Connected: {successful_connections}/{len(swarm_cli.cluster_nodes)} | "
+                      f"Avg Response: {avg_response:.1f}ms")
+            
+            # Health indicator
+            if successful_connections == len(swarm_cli.cluster_nodes):
+                click.echo("Status: ✓ All nodes healthy")
+            elif successful_connections >= len(swarm_cli.cluster_nodes) // 2 + 1:
+                click.echo("Status: ⚠ Majority healthy")
+            else:
+                click.echo("Status: ✗ Cluster unhealthy")
+            
+            update_counter += 1
+            
+            if count == 0 or update_counter < count:
+                await asyncio.sleep(interval)
+            
+    except KeyboardInterrupt:
+        click.echo(f"\nNetwork monitoring stopped after {update_counter} updates")
+
+@cli.command()
+@click.argument('host', default='localhost')
+@click.argument('start_port', type=int)
+@click.argument('end_port', type=int)
+async def scan(host, start_port, end_port):
+    """Scan for active Raft nodes on a host and port range
+    
+    HOST: Target host to scan (default: localhost)
+    START_PORT: Starting port number
+    END_PORT: Ending port number
+    
+    Examples:
+        scan localhost 8000 8010        # Scan localhost ports 8000-8010
+        scan 192.168.1.100 8001 8005    # Scan remote host specific range
+    """
+    if start_port > end_port:
+        click.echo("ERROR: Start port must be <= end port")
+        return
+    
+    port_range = end_port - start_port + 1
+    if port_range > 100:
+        click.echo("ERROR: Port range too large (max 100 ports)")
+        return
+    
+    click.echo(f"Scanning {host}:{start_port}-{end_port} for Raft nodes...")
+    click.echo("-" * 60)
+    
+    found_nodes = []
+    
+    for port in range(start_port, end_port + 1):
+        try:
+            node_metadata = NodeMetadata(host, port)
+            status = await RaftDroneClient.get_node_status(node_metadata)
+            
+            if status:
+                node_id = status.get('node_id', 'unknown')
+                state = status.get('state', 'unknown')
+                term = status.get('term', 0)
+                drone_connected = "YES" if status.get('drone_connected') else "NO"
+                
+                click.echo(f"✓ {host}:{port:<5} | {node_id:<8} | {state:<9} | Term {term} | Drone {drone_connected}")
+                found_nodes.append((node_metadata, status))
+            else:
+                click.echo(f"- {host}:{port:<5} | No Raft node")
+        
+        except Exception:
+            # Silently skip ports that can't be connected to
+            pass
+    
+    click.echo("-" * 60)
+    click.echo(f"Found {len(found_nodes)} active Raft nodes")
+    
+    if found_nodes:
+        # Find leader among discovered nodes
+        leader_node = None
+        for node_metadata, status in found_nodes:
+            if status.get('state') == 'leader':
+                leader_node = node_metadata
+                break
+        
+        if leader_node:
+            leader_addr = f"{leader_node.get_host()}:{leader_node.get_port()}"
+            click.echo(f"Leader found at: {leader_addr}")
+        else:
+            click.echo("No leader found among discovered nodes")
 
 # Async wrapper for click commands
 def async_command(f):

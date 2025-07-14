@@ -1,16 +1,10 @@
 import time
 from enum import Enum
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+from node_metadata import NodeMetadata
 
 
-class MessageTranslator:
-    """
-    TODO
-    MessageTranslator.py provides utility functions to translate
-    messages between the JSON that they are transmitted as over the network
-    and Message objects
-    """
 
 
 class NodeState(Enum):
@@ -56,7 +50,7 @@ class LogEntry:
 class Message:
     msg_type: str
     data: Dict[str, Any]
-    sender_id: str
+    sender: NodeMetadata  # Changed from sender_id(str) to NodeMetadata
 
 @dataclass
 class VoteRequest:
@@ -90,3 +84,19 @@ class SwarmCommand:
     command_type: str
     parameters: Dict[str, Any]
     target_nodes: List[str] = None  # None means all nodes
+
+
+class MessageTranslator:
+    """
+    TODO
+    MessageTranslator provides utility functions to translate
+    messages between the JSON that they are transmitted as over the network
+    and Message objects
+    """
+    @staticmethod
+    def message_to_json(message: Message) -> Optional[str]:
+        pass
+    
+    @staticmethod
+    def json_to_message(json_str: str) -> Optional[Message]:
+        pass

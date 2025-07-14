@@ -2,7 +2,7 @@
 """
 Integrated Raft-Drone Node - Combines Raft consensus with drone control
 Each Raft node controls a specific drone, enabling distributed consensus for swarm operations
-Enhanced with leader-centered formation system
+Enhanced with leader-centered formation system and NodeMetadata support
 """
 
 import asyncio
@@ -16,6 +16,7 @@ from util.calculate import Calculator
 from util.data_struct import CircularNodeList
 from util.logger_helper import LoggerFactory
 from config_manager import get_config_manager
+from node_metadata import NodeMetadata
 from typing import List, Dict, Optional, Tuple, Set
 from message import (
     Message, 
@@ -35,55 +36,64 @@ config_manager = get_config_manager()
 logger = LoggerFactory.get_logger(name="raft_node.py")
 
 
-
 class PeerHealthTracker:
-    """Tracks the health status of peer nodes"""
+    """Tracks the health status of peer nodes using NodeMetadata"""
     
-    def __init__(self, node_id: str, heartbeat_timeout: float = 10.0):
-        self.node_id = node_id
+    def __init__(self, node_metadata: NodeMetadata, heartbeat_timeout: float = 10.0):
+        self.node_metadata = node_metadata
         self.heartbeat_timeout = heartbeat_timeout
-        self.peer_health: Dict[str, float] = {}  # peer_id -> last_seen_timestamp
-        self.failed_peers: Set[str] = set()
+        self.peer_health: Dict[str, float] = {}  # "host:port" -> last_seen_timestamp
+        self.failed_peers: Set[str] = set()  # Set of "host:port" strings
         
-    def update_peer_heartbeat(self, peer_id: str):
+    def _peer_key(self, peer_metadata: NodeMetadata) -> str:
+        """Generate a unique key for peer"""
+        return f"{peer_metadata.get_host()}:{peer_metadata.get_port()}"
+        
+    def update_peer_heartbeat(self, peer_metadata: NodeMetadata):
         """Update the last seen time for a peer"""
-        self.peer_health[peer_id] = time.time()
+        peer_key = self._peer_key(peer_metadata)
+        self.peer_health[peer_key] = time.time()
         # Remove from failed peers if it was there
-        self.failed_peers.discard(peer_id)
+        self.failed_peers.discard(peer_key)
         
-    def mark_peer_failed(self, peer_id: str):
+    def mark_peer_failed(self, peer_metadata: NodeMetadata):
         """Manually mark a peer as failed"""
-        if peer_id != self.node_id:  # Don't mark self as failed
-            self.failed_peers.add(peer_id)
+        peer_key = self._peer_key(peer_metadata)
+        self_key = self._peer_key(self.node_metadata)
+        if peer_key != self_key:  # Don't mark self as failed
+            self.failed_peers.add(peer_key)
         
-    def get_active_peers(self, all_peers: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+    def get_active_peers(self, all_peers: List[NodeMetadata]) -> List[NodeMetadata]:
         """Get list of currently active (non-failed) peers"""
         current_time = time.time()
         active_peers = []
         
-        for peer_id, peer_port in all_peers:
+        for peer in all_peers:
+            peer_key = self._peer_key(peer)
+            self_key = self._peer_key(self.node_metadata)
+            
             # Always include self
-            if peer_id == self.node_id:
-                active_peers.append((peer_id, peer_port))
+            if peer_key == self_key:
+                active_peers.append(peer)
                 continue
                 
             # Check if peer is manually marked as failed
-            if peer_id in self.failed_peers:
+            if peer_key in self.failed_peers:
                 continue
                 
             # Check if we've seen a heartbeat recently
-            last_seen = self.peer_health.get(peer_id, 0)
+            last_seen = self.peer_health.get(peer_key, 0)
             if current_time - last_seen > self.heartbeat_timeout:
                 # Mark as failed due to timeout
-                self.failed_peers.add(peer_id)
+                self.failed_peers.add(peer_key)
                 continue
                 
-            active_peers.append((peer_id, peer_port))
+            active_peers.append(peer)
         
         return active_peers
     
     def get_failed_peers(self) -> Set[str]:
-        """Get set of failed peer IDs"""
+        """Get set of failed peer keys"""
         return self.failed_peers.copy()
 
 
@@ -94,11 +104,14 @@ class SocketProtocol:
     async def send_message(writer: asyncio.StreamWriter, message: Message):
         """Send a message over the socket connection"""
         try:
-            # Serialize message to JSON
+            # Serialize message to JSON, converting NodeMetadata to dict
             json_data = json.dumps({
                 'msg_type': message.msg_type,
                 'data': message.data,
-                'sender_id': message.sender_id
+                'sender': {
+                    'host': message.sender.get_host(),
+                    'port': message.sender.get_port()
+                }
             }).encode('utf-8')
             
             # Send length prefix + message
@@ -123,21 +136,26 @@ class SocketProtocol:
             json_data = await reader.readexactly(length)
             data = json.loads(json_data.decode('utf-8'))
             
+            # Reconstruct NodeMetadata from sender data
+            sender_data = data['sender']
+            sender = NodeMetadata(sender_data['host'], sender_data['port'])
+            
             return Message(
                 msg_type=data['msg_type'],
                 data=data['data'],
-                sender_id=data['sender_id']
+                sender=sender
             )
         except (asyncio.IncompleteReadError, json.JSONDecodeError, struct.error) as e:
             logger.debug(f"Error receiving message: {e}")
             return None
 
+
 class RaftDroneNode:
-    def __init__(self, node_id: str, port: int, drone_index: int, peers: List[Tuple[str, int]]):
-        self.node_id = node_id
-        self.port = port
+    def __init__(self, node_metadata: NodeMetadata, drone_index: int, peers: List[NodeMetadata]):
+        self.node_metadata = node_metadata
+        self.node_id = f"drone{drone_index + 1}"  # Keep node_id for compatibility
+        self.peers = peers  # List of NodeMetadata objects
         self.drone_index = drone_index
-        self.peers = peers  # List of (node_id, port) tuples
         
         # Get drone connection string from config
         drone_connection = config_manager.get_drone_connection(drone_index)
@@ -154,7 +172,7 @@ class RaftDroneNode:
         self.last_applied = 0
         self.state = NodeState.FOLLOWER
         
-        # Leader state
+        # Leader state - now using host:port keys
         self.next_index: Dict[str, int] = {}
         self.match_index: Dict[str, int] = {}
         
@@ -172,7 +190,7 @@ class RaftDroneNode:
         self.drone_monitor_task: Optional[asyncio.Task] = None
         
         # Peer Health Tracker
-        self.health_tracker = PeerHealthTracker(node_id)
+        self.health_tracker = PeerHealthTracker(node_metadata)
     
         # formation tracking
         self.last_formation_config = None
@@ -186,20 +204,24 @@ class RaftDroneNode:
             'leader_id': None,
             'leader_gps': None
         }
-        
+    
+    def _peer_key(self, peer_metadata: NodeMetadata) -> str:
+        """Generate a unique key for peer"""
+        return f"{peer_metadata.get_host()}:{peer_metadata.get_port()}"
         
     def _random_election_timeout(self) -> float:
         """Random election timeout between 1.5-3 seconds"""
         return random.uniform(1.5, 3.0)
     
-    def get_active_peers(self) -> List[Tuple[str, int]]:
+    def get_active_peers(self) -> List[NodeMetadata]:
         """Get currently active (non-failed) peers"""
         return self.health_tracker.get_active_peers(self.peers)
 
-    def handle_peer_communication_failure(self, peer_id: str):
+    def handle_peer_communication_failure(self, peer_metadata: NodeMetadata):
         """Handle communication failure with a peer"""
-        # logger.warning(f"Communication failed with peer {peer_id}")
-        self.health_tracker.mark_peer_failed(peer_id)
+        peer_key = self._peer_key(peer_metadata)
+        # logger.warning(f"Communication failed with peer {peer_key}")
+        self.health_tracker.mark_peer_failed(peer_metadata)
         
         # If we're the leader and have an active formation, recalculate
         if (self.state == NodeState.LEADER and 
@@ -208,9 +230,9 @@ class RaftDroneNode:
             logger.info("Triggering formation recalculation due to peer failure")
             asyncio.create_task(self.recalculate_formation())
 
-    def handle_successful_peer_communication(self, peer_id: str):
+    def handle_successful_peer_communication(self, peer_metadata: NodeMetadata):
         """Handle successful communication with a peer"""
-        self.health_tracker.update_peer_heartbeat(peer_id)
+        self.health_tracker.update_peer_heartbeat(peer_metadata)
     
     async def recalculate_formation(self):
         """Recalculate formation with current active nodes"""
@@ -233,7 +255,7 @@ class RaftDroneNode:
     
     async def start(self):
         """Start the Raft node and drone connection"""
-        logger.info(f"Starting Raft-Drone node {self.node_id} on port {self.port}")
+        logger.info(f"Starting Raft-Drone node {self.node_id} on {self.node_metadata.get_host()}:{self.node_metadata.get_port()}")
         
         # Connect to drone
         await self.connect_drone()
@@ -241,8 +263,8 @@ class RaftDroneNode:
         # Start TCP server
         self.server = await asyncio.start_server(
             self.handle_client_connection,
-            'localhost',
-            self.port
+            self.node_metadata.get_host(),
+            self.node_metadata.get_port()
         )
         
         # Start election timer
@@ -251,7 +273,7 @@ class RaftDroneNode:
         # Start drone monitoring
         self.drone_monitor_task = asyncio.create_task(self.drone_monitor_loop())
         
-        logger.info(f"Node {self.node_id} is listening on port {self.port}")
+        logger.info(f"Node {self.node_id} is listening on {self.node_metadata.get_host()}:{self.node_metadata.get_port()}")
     
     async def connect_drone(self):
         """Connect to the drone"""
@@ -479,14 +501,18 @@ class RaftDroneNode:
         if failed_peers:
             logger.warning(f"Formation calculation excluding failed peers: {failed_peers}")
         
-        logger.info(f"Formation calculation with {len(active_peers)} active nodes: {[node_id for node_id, _ in active_peers]}")
+        logger.info(f"Formation calculation with {len(active_peers)} active nodes: {[self._peer_key(p) for p in active_peers]}")
         
         if len(active_peers) <= 1:
             logger.warning("Not enough active peers for formation - only leader available")
             return [(0.0, 0.0)]  # Only leader position
         
         # Create circular node list with only active peers, excluding failed ones
-        circular_list = CircularNodeList(active_peers, failed_peers)
+        # Convert NodeMetadata to (node_id, port) format for CircularNodeList
+        active_peers_tuples = [(f"drone{i+1}", peer.get_port()) for i, peer in enumerate(active_peers)]
+        failed_peers_ids = set()  # Convert failed peer keys to node IDs if needed
+        
+        circular_list = CircularNodeList(active_peers_tuples, failed_peers_ids)
         
         # Get symmetric distribution around leader
         left_side, right_side = circular_list.get_symmetric_distribution(self.node_id)
@@ -596,12 +622,14 @@ class RaftDroneNode:
         
         # Return positions in the same order as active_peers (original peer order, but only active ones)
         final_positions = []
-        for node_id, _ in active_peers:
-            if node_id in positions_dict:
-                final_positions.append(positions_dict[node_id])
+        for peer in active_peers:
+            # Map peer to node_id for lookup
+            peer_node_id = f"drone{self.peers.index(peer) + 1}" if peer in self.peers else self.node_id
+            if peer_node_id in positions_dict:
+                final_positions.append(positions_dict[peer_node_id])
             else:
                 # This shouldn't happen, but handle gracefully
-                logger.warning(f"No position calculated for active node {node_id}")
+                logger.warning(f"No position calculated for active node {self._peer_key(peer)}")
                 final_positions.append((0.0, 0.0))
         
         # Log summary
@@ -630,15 +658,22 @@ class RaftDroneNode:
             writer.close()
             await writer.wait_closed()
     
+    def create_message(self, msg_type: str, data: Dict) -> Message:
+        """Helper method to create messages with proper sender"""
+        return Message(
+            msg_type=msg_type,
+            data=data,
+            sender=self.node_metadata
+        )
+    
     async def process_message(self, message: Message, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Process incoming messages"""
         try:
             if message.msg_type == MessageType.VOTE_REQUEST.value:
                 response = await self.handle_vote_request(VoteRequest(**message.data))
-                response_msg = Message(
-                    msg_type=MessageType.VOTE_RESPONSE.value,
-                    data=asdict(response),
-                    sender_id=self.node_id
+                response_msg = self.create_message(
+                    MessageType.VOTE_RESPONSE.value,
+                    asdict(response)
                 )
                 await SocketProtocol.send_message(writer, response_msg)
             
@@ -663,37 +698,33 @@ class RaftDroneNode:
                 
                 append_request = AppendEntriesRequest(**append_data)
                 response = await self.handle_append_entries(append_request)
-                response_msg = Message(
-                    msg_type=MessageType.APPEND_RESPONSE.value,
-                    data=asdict(response),
-                    sender_id=self.node_id
+                response_msg = self.create_message(
+                    MessageType.APPEND_RESPONSE.value,
+                    asdict(response)
                 )
                 await SocketProtocol.send_message(writer, response_msg)
             
             elif message.msg_type == MessageType.CLIENT_REQUEST.value:
                 response = await self.handle_client_request(message.data)
-                response_msg = Message(
-                    msg_type=MessageType.CLIENT_RESPONSE.value,
-                    data=response,
-                    sender_id=self.node_id
+                response_msg = self.create_message(
+                    MessageType.CLIENT_RESPONSE.value,
+                    response
                 )
                 await SocketProtocol.send_message(writer, response_msg)
             
             elif message.msg_type == MessageType.SWARM_COMMAND.value:
                 response = await self.handle_swarm_command(message.data)
-                response_msg = Message(
-                    msg_type=MessageType.SWARM_RESPONSE.value,
-                    data=response,
-                    sender_id=self.node_id
+                response_msg = self.create_message(
+                    MessageType.SWARM_RESPONSE.value,
+                    response
                 )
                 await SocketProtocol.send_message(writer, response_msg)
             
             elif message.msg_type == MessageType.STATUS_REQUEST.value:
                 response = await self.handle_status_request()
-                response_msg = Message(
-                    msg_type=MessageType.STATUS_RESPONSE.value,
-                    data=response,
-                    sender_id=self.node_id
+                response_msg = self.create_message(
+                    MessageType.STATUS_RESPONSE.value,
+                    response
                 )
                 await SocketProtocol.send_message(writer, response_msg)
         
@@ -829,10 +860,11 @@ class RaftDroneNode:
         # Convert relative positions to GPS coordinates for active nodes only
         formation_assignment = {}
         
-        for i, (node_id, _) in enumerate(active_peers):
-            if node_id == self.node_id:
+        for i, peer in enumerate(active_peers):
+            peer_key = self._peer_key(peer)
+            if peer == self.node_metadata:
                 # Leader stays at current position
-                formation_assignment[node_id] = {
+                formation_assignment[self.node_id] = {
                     'type': 'leader_center',
                     'lat': leader_lat,
                     'lon': leader_lon,
@@ -845,7 +877,10 @@ class RaftDroneNode:
                 rel_x, rel_y = relative_positions[i]
                 target_lat, target_lon = Calculator.relative_to_gps(leader_lat, leader_lon, rel_x, rel_y)
                 
-                formation_assignment[node_id] = {
+                # Map peer to node_id
+                peer_node_id = f"drone{self.peers.index(peer) + 1}" if peer in self.peers else f"node_{peer.get_port()}"
+                
+                formation_assignment[peer_node_id] = {
                     'type': 'follower_relative',
                     'lat': target_lat,
                     'lon': target_lon,
@@ -855,12 +890,14 @@ class RaftDroneNode:
                 }
         
         # Send formation command with GPS coordinates (only to active nodes)
+        active_node_ids = [self.node_id if peer == self.node_metadata else f"drone{self.peers.index(peer) + 1}" for peer in active_peers]
+        
         command = f"SET_FORMATION_GPS:{json.dumps({
             'formation_type': formation_type,
             'leader_id': self.node_id,
             'leader_gps': {'lat': leader_lat, 'lon': leader_lon, 'alt': leader_alt},
             'assignments': formation_assignment,
-            'active_nodes': [node_id for node_id, _ in active_peers],
+            'active_nodes': active_node_ids,
             'excluded_failed_nodes': list(failed_peers),
             'recalculation_time': time.time()
         })}"
@@ -960,9 +997,9 @@ class RaftDroneNode:
         success_count = 1  # Count self
         append_tasks = []
         
-        for peer_id, peer_port in self.peers:
-            if peer_id != self.node_id:
-                task = asyncio.create_task(self.send_append_entries_with_entry(peer_id, peer_port, log_entry))
+        for peer in self.peers:
+            if peer != self.node_metadata:
+                task = asyncio.create_task(self.send_append_entries_with_entry(peer, log_entry))
                 append_tasks.append(task)
         
         if append_tasks:
@@ -985,7 +1022,7 @@ class RaftDroneNode:
             logger.warning(f"Command failed to replicate: {command}")
             return False
     
-    async def send_append_entries_with_entry(self, peer_id: str, peer_port: int, entry: LogEntry) -> Optional[AppendEntriesResponse]:
+    async def send_append_entries_with_entry(self, peer_metadata: NodeMetadata, entry: LogEntry) -> Optional[AppendEntriesResponse]:
         """Send append entries with specific entry to a peer"""
         try:
             prev_log_index = entry.index - 1
@@ -1005,26 +1042,26 @@ class RaftDroneNode:
                 leader_commit=self.commit_index
             )
             
-            message = Message(
-                msg_type=MessageType.APPEND_ENTRIES.value,
-                data=asdict(append_request),
-                sender_id=self.node_id
+            message = self.create_message(
+                MessageType.APPEND_ENTRIES.value,
+                asdict(append_request)
             )
             
-            response_msg = await self.send_message_to_peer(peer_id, peer_port, message)
+            response_msg = await self.send_message_to_peer(peer_metadata, message)
             if response_msg and response_msg.msg_type == MessageType.APPEND_RESPONSE.value:
                 return AppendEntriesResponse(**response_msg.data)
         
         except Exception as e:
-            logger.debug(f"Failed to send append entries to {peer_id}: {e}")
+            peer_key = self._peer_key(peer_metadata)
+            logger.debug(f"Failed to send append entries to {peer_key}: {e}")
         
         return None
     
-    async def send_message_to_peer(self, peer_id: str, peer_port: int, message: Message) -> Optional[Message]:
+    async def send_message_to_peer(self, peer_metadata: NodeMetadata, message: Message) -> Optional[Message]:
         """Send message to a peer and wait for response - WITH HEALTH TRACKING"""
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection('localhost', peer_port),
+                asyncio.open_connection(peer_metadata.get_host(), peer_metadata.get_port()),
                 timeout=2.0  # Increased timeout
             )
             
@@ -1036,16 +1073,17 @@ class RaftDroneNode:
                 )
                 # Mark successful communication
                 if response:
-                    self.handle_successful_peer_communication(peer_id)
+                    self.handle_successful_peer_communication(peer_metadata)
                 return response
             finally:
                 writer.close()
                 await writer.wait_closed()
         
         except Exception as e:
-            logger.debug(f"Failed to send message to {peer_id}: {e}")
+            peer_key = self._peer_key(peer_metadata)
+            logger.debug(f"Failed to send message to {peer_key}: {e}")
             # Mark communication failure
-            self.handle_peer_communication_failure(peer_id)
+            self.handle_peer_communication_failure(peer_metadata)
             return None
     
     async def election_timer(self):
@@ -1075,9 +1113,9 @@ class RaftDroneNode:
         votes_needed = len(self.peers) // 2 + 1
         
         vote_tasks = []
-        for peer_id, peer_port in self.peers:
-            if peer_id != self.node_id:
-                task = asyncio.create_task(self.request_vote_from_peer(peer_id, peer_port))
+        for peer in self.peers:
+            if peer != self.node_metadata:
+                task = asyncio.create_task(self.request_vote_from_peer(peer))
                 vote_tasks.append(task)
         
         if vote_tasks:
@@ -1097,7 +1135,7 @@ class RaftDroneNode:
             logger.info(f"Election failed. Got {votes_received}/{votes_needed} votes")
             self.state = NodeState.FOLLOWER
     
-    async def request_vote_from_peer(self, peer_id: str, peer_port: int) -> Optional[VoteResponse]:
+    async def request_vote_from_peer(self, peer_metadata: NodeMetadata) -> Optional[VoteResponse]:
         """Request vote from a peer"""
         try:
             last_log_index = len(self.log) - 1 if self.log else -1
@@ -1110,18 +1148,18 @@ class RaftDroneNode:
                 last_log_term=last_log_term
             )
             
-            message = Message(
-                msg_type=MessageType.VOTE_REQUEST.value,
-                data=asdict(vote_request),
-                sender_id=self.node_id
+            message = self.create_message(
+                MessageType.VOTE_REQUEST.value,
+                asdict(vote_request)
             )
             
-            response_msg = await self.send_message_to_peer(peer_id, peer_port, message)
+            response_msg = await self.send_message_to_peer(peer_metadata, message)
             if response_msg and response_msg.msg_type == MessageType.VOTE_RESPONSE.value:
                 return VoteResponse(**response_msg.data)
         
         except Exception as e:
-            logger.debug(f"Failed to request vote from {peer_id}: {e}")
+            peer_key = self._peer_key(peer_metadata)
+            logger.debug(f"Failed to request vote from {peer_key}: {e}")
         
         return None
     
@@ -1130,10 +1168,11 @@ class RaftDroneNode:
         logger.info(f"Became leader for term {self.current_term}")
         self.state = NodeState.LEADER
         
-        for peer_id, _ in self.peers:
-            if peer_id != self.node_id:
-                self.next_index[peer_id] = len(self.log)
-                self.match_index[peer_id] = -1
+        for peer in self.peers:
+            if peer != self.node_metadata:
+                peer_key = self._peer_key(peer)
+                self.next_index[peer_key] = len(self.log)
+                self.match_index[peer_key] = -1
         
         if self.heartbeat_task:
             self.heartbeat_task.cancel()
@@ -1144,9 +1183,9 @@ class RaftDroneNode:
         while self.state == NodeState.LEADER:
             try:
                 heartbeat_tasks = []
-                for peer_id, peer_port in self.peers:
-                    if peer_id != self.node_id:
-                        task = asyncio.create_task(self.send_append_entries(peer_id, peer_port))
+                for peer in self.peers:
+                    if peer != self.node_metadata:
+                        task = asyncio.create_task(self.send_append_entries(peer))
                         heartbeat_tasks.append(task)
                 
                 if heartbeat_tasks:
@@ -1156,10 +1195,11 @@ class RaftDroneNode:
             except Exception as e:
                 logger.error(f"Error sending heartbeats: {e}")
     
-    async def send_append_entries(self, peer_id: str, peer_port: int):
+    async def send_append_entries(self, peer_metadata: NodeMetadata):
         """Send append entries (heartbeat) to a peer"""
         try:
-            prev_log_index = self.next_index.get(peer_id, 0) - 1
+            peer_key = self._peer_key(peer_metadata)
+            prev_log_index = self.next_index.get(peer_key, 0) - 1
             prev_log_term = 0
             if prev_log_index >= 0 and prev_log_index < len(self.log):
                 prev_log_term = self.log[prev_log_index].term
@@ -1168,7 +1208,7 @@ class RaftDroneNode:
             entries = []
             
             # If there are entries to replicate to this peer
-            next_idx = self.next_index.get(peer_id, len(self.log))
+            next_idx = self.next_index.get(peer_key, len(self.log))
             if next_idx < len(self.log):
                 # Send pending entries as dicts
                 entries = [asdict(entry) for entry in self.log[next_idx:]]
@@ -1182,39 +1222,39 @@ class RaftDroneNode:
                 leader_commit=self.commit_index
             )
             
-            message = Message(
-                msg_type=MessageType.APPEND_ENTRIES.value,
-                data=asdict(append_request),
-                sender_id=self.node_id
+            message = self.create_message(
+                MessageType.APPEND_ENTRIES.value,
+                asdict(append_request)
             )
             
-            response_msg = await self.send_message_to_peer(peer_id, peer_port, message)
+            response_msg = await self.send_message_to_peer(peer_metadata, message)
             if response_msg and response_msg.msg_type == MessageType.APPEND_RESPONSE.value:
                 # Mark successful communication
-                self.handle_successful_peer_communication(peer_id)
+                self.handle_successful_peer_communication(peer_metadata)
                 
                 append_response = AppendEntriesResponse(**response_msg.data)
                 
                 if append_response.success:
                     # Update next_index and match_index for successful replication
                     if entries:
-                        self.next_index[peer_id] = len(self.log)
-                        self.match_index[peer_id] = len(self.log) - 1
+                        self.next_index[peer_key] = len(self.log)
+                        self.match_index[peer_key] = len(self.log) - 1
                 else:
                     # Decrement next_index on failure for log consistency
-                    if peer_id in self.next_index and self.next_index[peer_id] > 0:
-                        self.next_index[peer_id] -= 1
+                    if peer_key in self.next_index and self.next_index[peer_key] > 0:
+                        self.next_index[peer_key] -= 1
                 
                 if append_response.term > self.current_term:
                     await self.step_down(append_response.term)
             else:
                 # Mark communication failure
-                self.handle_peer_communication_failure(peer_id)
+                self.handle_peer_communication_failure(peer_metadata)
         
         except Exception as e:
-            logger.debug(f"Failed to send heartbeat to {peer_id}: {e}")
+            peer_key = self._peer_key(peer_metadata)
+            logger.debug(f"Failed to send heartbeat to {peer_key}: {e}")
             # Mark communication failure
-            self.handle_peer_communication_failure(peer_id)
+            self.handle_peer_communication_failure(peer_metadata)
     
     async def step_down(self, new_term: int):
         """Step down from leadership and update term"""
@@ -1335,13 +1375,13 @@ class RaftDroneNode:
             'voted_for': self.voted_for,
             'log_length': len(self.log),
             'commit_index': self.commit_index,
-            'port': self.port,
+            'address': f"{self.node_metadata.get_host()}:{self.node_metadata.get_port()}",
             'drone_index': self.drone_index,
             'drone_connected': self.drone_connected,
             'drone_status': drone_status,
             'swarm_state': self.swarm_state,
             'peer_health': {
-                'active_peers': [node_id for node_id, _ in active_peers],
+                'active_peers': [self._peer_key(p) for p in active_peers],
                 'failed_peers': list(failed_peers),
                 'total_peers': len(self.peers),
                 'active_count': len(active_peers)
@@ -1370,12 +1410,13 @@ class RaftDroneNode:
         if self.drone_controller:
             self.drone_controller.cleanup()
 
+
 # Client utilities for swarm control
 class RaftDroneClient:
-    """Client for interacting with Raft-Drone cluster"""
+    """Client for interacting with Raft-Drone cluster using NodeMetadata"""
     
     @staticmethod
-    async def send_swarm_command(host: str, port: int, command_type: str, parameters: Dict = None) -> Optional[Dict]:
+    async def send_swarm_command(node_metadata: NodeMetadata, command_type: str, parameters: Dict = None) -> Optional[Dict]:
         """Send a swarm command to the cluster leader"""
         try:
             swarm_command = SwarmCommand(
@@ -1383,13 +1424,16 @@ class RaftDroneClient:
                 parameters=parameters or {}
             )
             
+            # Create a dummy client NodeMetadata for sender
+            client_metadata = NodeMetadata('client', 0)
+            
             message = Message(
                 msg_type=MessageType.SWARM_COMMAND.value,
                 data=asdict(swarm_command),
-                sender_id='client'
+                sender=client_metadata
             )
             
-            reader, writer = await asyncio.open_connection(host, port)
+            reader, writer = await asyncio.open_connection(node_metadata.get_host(), node_metadata.get_port())
             try:
                 await SocketProtocol.send_message(writer, message)
                 response = await SocketProtocol.receive_message(reader)
@@ -1406,16 +1450,18 @@ class RaftDroneClient:
         return None
     
     @staticmethod
-    async def get_node_status(host: str, port: int) -> Optional[Dict]:
+    async def get_node_status(node_metadata: NodeMetadata) -> Optional[Dict]:
         """Get status from a Raft-Drone node"""
         try:
+            client_metadata = NodeMetadata('client', 0)
+            
             message = Message(
                 msg_type=MessageType.STATUS_REQUEST.value,
                 data={},
-                sender_id='client'
+                sender=client_metadata
             )
             
-            reader, writer = await asyncio.open_connection(host, port)
+            reader, writer = await asyncio.open_connection(node_metadata.get_host(), node_metadata.get_port())
             try:
                 await SocketProtocol.send_message(writer, message)
                 response = await SocketProtocol.receive_message(reader)
@@ -1432,16 +1478,17 @@ class RaftDroneClient:
         return None
     
     @staticmethod
-    async def find_leader(ports: List[int]) -> Optional[Tuple[str, int]]:
+    async def find_leader(node_metadatas: List[NodeMetadata]) -> Optional[NodeMetadata]:
         """Find the current leader in the cluster"""
-        for port in ports:
-            status = await RaftDroneClient.get_node_status('localhost', port)
+        for node_metadata in node_metadatas:
+            status = await RaftDroneClient.get_node_status(node_metadata)
             if status and status.get('state') == 'leader':
-                return status.get('node_id'), port
+                return node_metadata
         return None
 
-async def create_single_raft_drone_node(port: int):
-    """Create and start a single Raft-Drone node"""
+
+async def create_single_raft_drone_node(host: str, port: int):
+    """Create and start a single Raft-Drone node using NodeMetadata"""
     try:
         # Get configuration from config manager
         all_nodes = config_manager.get_all_nodes()
@@ -1454,14 +1501,17 @@ async def create_single_raft_drone_node(port: int):
         drone_index = config_manager.get_drone_index_by_port(port)
         node_id = config_manager.get_node_id_by_port(port)
         
-        # Create peer list (node_id, port)
-        peers = [(node_id, node_port) for node_id, node_port, _ in all_nodes]
+        # Create NodeMetadata for this node
+        node_metadata = NodeMetadata(host, port)
         
-        print(f"Creating node {node_id} (drone{drone_index}) on port {port}")
-        print(f"Peers: {peers}")
+        # Create peer list as NodeMetadata objects
+        peers = [NodeMetadata(host, node_port) for node_id, node_port, _ in all_nodes]
+        
+        print(f"Creating node {node_id} (drone{drone_index}) at {host}:{port}")
+        print(f"Peers: {[f'{p.get_host()}:{p.get_port()}' for p in peers]}")
         
         # Create and start the node
-        node = RaftDroneNode(node_id, port, drone_index, peers)
+        node = RaftDroneNode(node_metadata, drone_index, peers)
         await node.start()
         
         return node
@@ -1470,12 +1520,13 @@ async def create_single_raft_drone_node(port: int):
         print(f"Error creating node: {e}")
         raise
 
+
 async def main():
     """Main function with command line argument parsing"""
     import sys
     
-    if len(sys.argv) == 1:
-        print("Usage: python raft_node.py <port>")
+    if len(sys.argv) < 2:
+        print("Usage: python raft_node.py <port> [host]")
         try:
             available_ports = config_manager.get_all_ports()
             print(f"Available ports: {available_ports}")
@@ -1485,7 +1536,9 @@ async def main():
     
     try:
         port = int(sys.argv[1])
-        await create_single_raft_drone_node(port)
+        host = sys.argv[2] if len(sys.argv) > 2 else 'localhost'
+        
+        await create_single_raft_drone_node(host, port)
         
         # Keep running
         while True:
@@ -1497,6 +1550,7 @@ async def main():
         print("\nShutting down...")
     except Exception as e:
         print(f"Unexpected error: {e}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
