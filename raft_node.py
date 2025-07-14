@@ -11,8 +11,8 @@ import random
 import time
 import struct
 from dataclasses import asdict
-from libs.control import DroneController
-from util.cal import Calculator
+from core.control import DroneController
+from util.calculate import Calculator
 from util.data_struct import CircularNodeList
 from util.logger_helper import LoggerFactory
 from config_manager import get_config_manager
@@ -85,7 +85,6 @@ class PeerHealthTracker:
     def get_failed_peers(self) -> Set[str]:
         """Get set of failed peer IDs"""
         return self.failed_peers.copy()
-
 
 
 class SocketProtocol:
@@ -432,7 +431,7 @@ class RaftDroneNode:
                     current_lat, current_lon = current_pos
                     
                     # Calculate distance to target
-                    from util.cal import Calculator
+                    from util.calculate import Calculator
                     distance, bearing = Calculator.calculate_distance_bearing(
                         current_lat, current_lon, target_lat, target_lon
                     )
