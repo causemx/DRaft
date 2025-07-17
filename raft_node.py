@@ -15,9 +15,9 @@ from core.control import DroneController
 from util.calculate import Calculator
 from util.data_struct import CircularNodeList
 from util.logger_helper import LoggerFactory
-from config_manager import get_config_manager
+from confs.config_manager import get_config_manager
 from node_metadata import NodeMetadata
-from network_comm import NetworkComm
+from net.network_comm import NetworkComm
 from typing import List, Dict, Optional, Tuple, Set
 from message import (
     Message, 

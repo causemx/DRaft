@@ -1,5 +1,5 @@
 """
-NetworkUtil.py provides utility networking functions
+network_utils.py provides utility networking functions
 """
 
 import socket

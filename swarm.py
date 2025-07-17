@@ -12,7 +12,7 @@ from typing import Optional, Dict, List
 # Import from raft_node.py and config_manager.py
 try:
     from raft_node import RaftDroneClient, SwarmCommandType, Message, MessageType
-    from config_manager import get_config_manager
+    from confs.config_manager import get_config_manager
     from node_metadata import NodeMetadata
 except ImportError:
     print("Error: Cannot import required modules")
