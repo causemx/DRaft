@@ -1,10 +1,9 @@
+import json
 import time
 from enum import Enum
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from node_metadata import NodeMetadata
-
-
 
 
 class NodeState(Enum):
@@ -95,8 +94,43 @@ class MessageTranslator:
     """
     @staticmethod
     def message_to_json(message: Message) -> Optional[str]:
-        pass
+        try:
+            # Convert Message to dictionary with NodeMetadata serialization
+            message_dict = {
+                'msg_type': message.msg_type,
+                'data': message.data,
+                'sender': {
+                    'host': message.sender.get_host(),
+                    'port': message.sender.get_port()
+                }
+            }
+            
+            return json.dumps(message_dict)
+            
+        except Exception as e:
+            print(f"Error serializing message to JSON: {e}")
+            return None
     
     @staticmethod
     def json_to_message(json_str: str) -> Optional[Message]:
-        pass
+        try:
+            # Parse JSON string
+            data = json.loads(json_str)
+            
+            # Reconstruct NodeMetadata from sender data
+            sender_data = data.get('sender', {})
+            sender = NodeMetadata(
+                host=sender_data.get('host', 'unknown'),
+                port=sender_data.get('port', 0)
+            )
+            
+            # Create Message object
+            return Message(
+                msg_type=data.get('msg_type', ''),
+                data=data.get('data', {}),
+                sender=sender
+            )
+            
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            print(f"Error parsing JSON to message: {e}")
+            return None
