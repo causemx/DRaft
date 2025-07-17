@@ -11,7 +11,7 @@ from typing import Optional, Dict, List
 
 # Import from raft_node.py and config_manager.py
 try:
-    from raft_node import RaftDroneClient, SwarmCommandType, SocketProtocol, Message, MessageType
+    from raft_node import RaftDroneClient, SwarmCommandType, Message, MessageType
     from config_manager import get_config_manager
     from node_metadata import NodeMetadata
 except ImportError:
@@ -655,8 +655,9 @@ async def raw(command):
             swarm_cli.current_leader.get_port()
         )
         try:
-            await SocketProtocol.send_message(writer, message)
-            response = await SocketProtocol.receive_message(reader)
+            # Use NetworkComm's protocol instead of SocketProtocol
+            await SwarmCLI._send_message_with_length_prefix(writer, message)
+            response = await SwarmCLI._receive_message_with_length_prefix(reader)
             
             if response and response.msg_type == MessageType.CLIENT_RESPONSE.value:
                 result = response.data

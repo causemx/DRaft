@@ -17,6 +17,7 @@ from util.data_struct import CircularNodeList
 from util.logger_helper import LoggerFactory
 from config_manager import get_config_manager
 from node_metadata import NodeMetadata
+from network_comm import NetworkComm
 from typing import List, Dict, Optional, Tuple, Set
 from message import (
     Message, 
@@ -97,65 +98,22 @@ class PeerHealthTracker:
         return self.failed_peers.copy()
 
 
-class SocketProtocol:
-    """Simple protocol for sending/receiving messages over TCP"""
-    
-    @staticmethod
-    async def send_message(writer: asyncio.StreamWriter, message: Message):
-        """Send a message over the socket connection"""
-        try:
-            # Serialize message to JSON, converting NodeMetadata to dict
-            json_data = json.dumps({
-                'msg_type': message.msg_type,
-                'data': message.data,
-                'sender': {
-                    'host': message.sender.get_host(),
-                    'port': message.sender.get_port()
-                }
-            }).encode('utf-8')
-            
-            # Send length prefix + message
-            length = struct.pack('!I', len(json_data))
-            writer.write(length + json_data)
-            await writer.drain()
-        except Exception as e:
-            logger.error(f"Error sending message: {e}")
-    
-    @staticmethod
-    async def receive_message(reader: asyncio.StreamReader) -> Optional[Message]:
-        """Receive a message from the socket connection"""
-        try:
-            # Read length prefix
-            length_data = await reader.readexactly(4)
-            if not length_data:
-                return None
-            
-            length = struct.unpack('!I', length_data)[0]
-            
-            # Read message data
-            json_data = await reader.readexactly(length)
-            data = json.loads(json_data.decode('utf-8'))
-            
-            # Reconstruct NodeMetadata from sender data
-            sender_data = data['sender']
-            sender = NodeMetadata(sender_data['host'], sender_data['port'])
-            
-            return Message(
-                msg_type=data['msg_type'],
-                data=data['data'],
-                sender=sender
-            )
-        except (asyncio.IncompleteReadError, json.JSONDecodeError, struct.error) as e:
-            logger.debug(f"Error receiving message: {e}")
-            return None
-
-
 class RaftDroneNode:
     def __init__(self, node_metadata: NodeMetadata, drone_index: int, peers: List[NodeMetadata]):
         self.node_metadata = node_metadata
         self.node_id = f"drone{drone_index + 1}"  # Keep node_id for compatibility
         self.peers = peers  # List of NodeMetadata objects
         self.drone_index = drone_index
+        
+        # Create SimpleNetworkComm instead of manual server
+        self.network_comm = NetworkComm(
+            nodes=peers,
+            port=node_metadata.get_port(),
+            send_timeout=5.0
+        )
+        
+        # Set Raft's connection handler
+        self.network_comm.set_connection_handler(self.handle_client_connection)
         
         # Get drone connection string from config
         drone_connection = config_manager.get_drone_connection(drone_index)
@@ -260,12 +218,7 @@ class RaftDroneNode:
         # Connect to drone
         await self.connect_drone()
         
-        # Start TCP server
-        self.server = await asyncio.start_server(
-            self.handle_client_connection,
-            self.node_metadata.get_host(),
-            self.node_metadata.get_port()
-        )
+        await self.network_comm.run()
         
         # Start election timer
         self.election_task = asyncio.create_task(self.election_timer())
@@ -647,7 +600,7 @@ class RaftDroneNode:
         
         try:
             while True:
-                message = await SocketProtocol.receive_message(reader)
+                message = await self.network_comm._receive_message(reader)
                 if not message:
                     break
                 
@@ -675,7 +628,7 @@ class RaftDroneNode:
                     MessageType.VOTE_RESPONSE.value,
                     asdict(response)
                 )
-                await SocketProtocol.send_message(writer, response_msg)
+                await self.network_comm._send_message(writer, response_msg)
             
             elif message.msg_type == MessageType.APPEND_ENTRIES.value:
                 # Convert serialized entries back to LogEntry objects
@@ -702,7 +655,7 @@ class RaftDroneNode:
                     MessageType.APPEND_RESPONSE.value,
                     asdict(response)
                 )
-                await SocketProtocol.send_message(writer, response_msg)
+                await self.network_comm._send_message(writer, response_msg)
             
             elif message.msg_type == MessageType.CLIENT_REQUEST.value:
                 response = await self.handle_client_request(message.data)
@@ -710,7 +663,7 @@ class RaftDroneNode:
                     MessageType.CLIENT_RESPONSE.value,
                     response
                 )
-                await SocketProtocol.send_message(writer, response_msg)
+                await self.network_comm._send_message(writer, response_msg)
             
             elif message.msg_type == MessageType.SWARM_COMMAND.value:
                 response = await self.handle_swarm_command(message.data)
@@ -718,7 +671,7 @@ class RaftDroneNode:
                     MessageType.SWARM_RESPONSE.value,
                     response
                 )
-                await SocketProtocol.send_message(writer, response_msg)
+                await self.network_comm._send_message(writer, response_msg)
             
             elif message.msg_type == MessageType.STATUS_REQUEST.value:
                 response = await self.handle_status_request()
@@ -726,7 +679,7 @@ class RaftDroneNode:
                     MessageType.STATUS_RESPONSE.value,
                     response
                 )
-                await SocketProtocol.send_message(writer, response_msg)
+                await self.network_comm._send_message(writer, response_msg)
         
         except Exception as e:
             logger.error(f"Error processing message: {e}")
@@ -1066,15 +1019,7 @@ class RaftDroneNode:
             )
             
             try:
-                await SocketProtocol.send_message(writer, message)
-                response = await asyncio.wait_for(
-                    SocketProtocol.receive_message(reader),
-                    timeout=2.0
-                )
-                # Mark successful communication
-                if response:
-                    self.handle_successful_peer_communication(peer_metadata)
-                return response
+                return await self.network_comm.send_message_with_response(peer_metadata, message)
             finally:
                 writer.close()
                 await writer.wait_closed()
@@ -1394,9 +1339,7 @@ class RaftDroneNode:
     
     async def stop(self):
         """Stop the node and disconnect drone"""
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
+        await self.network_comm.stop()
         
         if self.heartbeat_task:
             self.heartbeat_task.cancel()
@@ -1413,7 +1356,56 @@ class RaftDroneNode:
 
 # Client utilities for swarm control
 class RaftDroneClient:
-    """Client for interacting with Raft-Drone cluster using NodeMetadata"""
+    """Client for interacting with Raft-Drone cluster using NetworkComm protocol"""
+    
+    @staticmethod
+    async def _send_message_with_length_prefix(writer: asyncio.StreamWriter, message: Message):
+        """Send message using NetworkComm's length-prefixed protocol"""
+        try:
+            # Convert message to JSON (same as NetworkComm._send_message)
+            json_data = json.dumps({
+                'msg_type': message.msg_type,
+                'data': message.data,
+                'sender': {
+                    'host': message.sender.get_host(),
+                    'port': message.sender.get_port()
+                }
+            }).encode('utf-8')
+            
+            # Send length prefix + message
+            length = struct.pack('!I', len(json_data))
+            writer.write(length + json_data)
+            await writer.drain()
+        except Exception as e:
+            logger.error(f"Error sending message: {e}")
+
+    @staticmethod
+    async def _receive_message_with_length_prefix(reader: asyncio.StreamReader) -> Optional[Message]:
+        """Receive message using NetworkComm's length-prefixed protocol"""
+        try:
+            # Read length prefix
+            length_data = await reader.readexactly(4)
+            if not length_data:
+                return None
+            
+            length = struct.unpack('!I', length_data)[0]
+            
+            # Read message data
+            json_data = await reader.readexactly(length)
+            data = json.loads(json_data.decode('utf-8'))
+            
+            # Reconstruct message
+            sender_data = data['sender']
+            sender = NodeMetadata(sender_data['host'], sender_data['port'])
+            
+            return Message(
+                msg_type=data['msg_type'],
+                data=data['data'],
+                sender=sender
+            )
+        except (asyncio.IncompleteReadError, json.JSONDecodeError, struct.error) as e:
+            logger.debug(f"Error receiving message: {e}")
+            return None
     
     @staticmethod
     async def send_swarm_command(node_metadata: NodeMetadata, command_type: str, parameters: Dict = None) -> Optional[Dict]:
@@ -1435,8 +1427,9 @@ class RaftDroneClient:
             
             reader, writer = await asyncio.open_connection(node_metadata.get_host(), node_metadata.get_port())
             try:
-                await SocketProtocol.send_message(writer, message)
-                response = await SocketProtocol.receive_message(reader)
+                # Use NetworkComm's protocol instead of SocketProtocol
+                await RaftDroneClient._send_message_with_length_prefix(writer, message)
+                response = await RaftDroneClient._receive_message_with_length_prefix(reader)
                 
                 if response and response.msg_type == MessageType.SWARM_RESPONSE.value:
                     return response.data
@@ -1463,8 +1456,9 @@ class RaftDroneClient:
             
             reader, writer = await asyncio.open_connection(node_metadata.get_host(), node_metadata.get_port())
             try:
-                await SocketProtocol.send_message(writer, message)
-                response = await SocketProtocol.receive_message(reader)
+                # Use NetworkComm's protocol instead of SocketProtocol
+                await RaftDroneClient._send_message_with_length_prefix(writer, message)
+                response = await RaftDroneClient._receive_message_with_length_prefix(reader)
                 
                 if response and response.msg_type == MessageType.STATUS_RESPONSE.value:
                     return response.data
