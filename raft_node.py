@@ -9,7 +9,6 @@ import asyncio
 import json
 import random
 import time
-import struct
 from dataclasses import asdict
 from core.control import DroneController
 from util.calculate import Calculator
@@ -18,7 +17,8 @@ from util.logger_helper import LoggerFactory
 from confs.config_manager import get_config_manager
 from node_metadata import NodeMetadata
 from net.network_comm import NetworkComm
-from typing import List, Dict, Optional, Tuple, Set
+from health_tracker import PeerHealthTracker
+from typing import List, Dict, Optional, Tuple
 from message import (
     Message, 
     LogEntry, 
@@ -35,67 +35,6 @@ from message import (
 # Global configuration manager
 config_manager = get_config_manager()
 logger = LoggerFactory.get_logger(name="raft_node.py")
-
-
-class PeerHealthTracker:
-    """Tracks the health status of peer nodes using NodeMetadata"""
-    
-    def __init__(self, node_metadata: NodeMetadata, heartbeat_timeout: float = 10.0):
-        self.node_metadata = node_metadata
-        self.heartbeat_timeout = heartbeat_timeout
-        self.peer_health: Dict[str, float] = {}  # "host:port" -> last_seen_timestamp
-        self.failed_peers: Set[str] = set()  # Set of "host:port" strings
-        
-    def _peer_key(self, peer_metadata: NodeMetadata) -> str:
-        """Generate a unique key for peer"""
-        return f"{peer_metadata.get_host()}:{peer_metadata.get_port()}"
-        
-    def update_peer_heartbeat(self, peer_metadata: NodeMetadata):
-        """Update the last seen time for a peer"""
-        peer_key = self._peer_key(peer_metadata)
-        self.peer_health[peer_key] = time.time()
-        # Remove from failed peers if it was there
-        self.failed_peers.discard(peer_key)
-        
-    def mark_peer_failed(self, peer_metadata: NodeMetadata):
-        """Manually mark a peer as failed"""
-        peer_key = self._peer_key(peer_metadata)
-        self_key = self._peer_key(self.node_metadata)
-        if peer_key != self_key:  # Don't mark self as failed
-            self.failed_peers.add(peer_key)
-        
-    def get_active_peers(self, all_peers: List[NodeMetadata]) -> List[NodeMetadata]:
-        """Get list of currently active (non-failed) peers"""
-        current_time = time.time()
-        active_peers = []
-        
-        for peer in all_peers:
-            peer_key = self._peer_key(peer)
-            self_key = self._peer_key(self.node_metadata)
-            
-            # Always include self
-            if peer_key == self_key:
-                active_peers.append(peer)
-                continue
-                
-            # Check if peer is manually marked as failed
-            if peer_key in self.failed_peers:
-                continue
-                
-            # Check if we've seen a heartbeat recently
-            last_seen = self.peer_health.get(peer_key, 0)
-            if current_time - last_seen > self.heartbeat_timeout:
-                # Mark as failed due to timeout
-                self.failed_peers.add(peer_key)
-                continue
-                
-            active_peers.append(peer)
-        
-        return active_peers
-    
-    def get_failed_peers(self) -> Set[str]:
-        """Get set of failed peer keys"""
-        return self.failed_peers.copy()
 
 
 class RaftDroneNode:
@@ -1354,134 +1293,6 @@ class RaftDroneNode:
         if self.drone_controller:
             self.drone_controller.cleanup()
 
-
-# Client utilities for swarm control
-class RaftDroneClient:
-    """Client for interacting with Raft-Drone cluster using NetworkComm protocol"""
-    
-    @staticmethod
-    async def _send_message_with_length_prefix(writer: asyncio.StreamWriter, message: Message):
-        """Send message using NetworkComm's length-prefixed protocol"""
-        try:
-            # Convert message to JSON (same as NetworkComm._send_message)
-            json_data = json.dumps({
-                'msg_type': message.msg_type,
-                'data': message.data,
-                'sender': {
-                    'host': message.sender.get_host(),
-                    'port': message.sender.get_port()
-                }
-            }).encode('utf-8')
-            
-            # Send length prefix + message
-            length = struct.pack('!I', len(json_data))
-            writer.write(length + json_data)
-            await writer.drain()
-        except Exception as e:
-            logger.error(f"Error sending message: {e}")
-
-    @staticmethod
-    async def _receive_message_with_length_prefix(reader: asyncio.StreamReader) -> Optional[Message]:
-        """Receive message using NetworkComm's length-prefixed protocol"""
-        try:
-            # Read length prefix
-            length_data = await reader.readexactly(4)
-            if not length_data:
-                return None
-            
-            length = struct.unpack('!I', length_data)[0]
-            
-            # Read message data
-            json_data = await reader.readexactly(length)
-            data = json.loads(json_data.decode('utf-8'))
-            
-            # Reconstruct message
-            sender_data = data['sender']
-            sender = NodeMetadata(sender_data['host'], sender_data['port'])
-            
-            return Message(
-                msg_type=data['msg_type'],
-                data=data['data'],
-                sender=sender
-            )
-        except (asyncio.IncompleteReadError, json.JSONDecodeError, struct.error) as e:
-            logger.debug(f"Error receiving message: {e}")
-            return None
-    
-    @staticmethod
-    async def send_swarm_command(node_metadata: NodeMetadata, command_type: str, parameters: Dict = None) -> Optional[Dict]:
-        """Send a swarm command to the cluster leader"""
-        try:
-            swarm_command = SwarmCommand(
-                command_type=command_type,
-                parameters=parameters or {}
-            )
-            
-            # Create a dummy client NodeMetadata for sender
-            client_metadata = NodeMetadata('client', 0)
-            
-            message = Message(
-                msg_type=MessageType.SWARM_COMMAND.value,
-                data=asdict(swarm_command),
-                sender=client_metadata
-            )
-            
-            reader, writer = await asyncio.open_connection(node_metadata.get_host(), node_metadata.get_port())
-            try:
-                # Use NetworkComm's protocol instead of SocketProtocol
-                await RaftDroneClient._send_message_with_length_prefix(writer, message)
-                response = await RaftDroneClient._receive_message_with_length_prefix(reader)
-                
-                if response and response.msg_type == MessageType.SWARM_RESPONSE.value:
-                    return response.data
-            finally:
-                writer.close()
-                await writer.wait_closed()
-        
-        except Exception as e:
-            logger.error(f"Swarm command failed: {e}")
-        
-        return None
-    
-    @staticmethod
-    async def get_node_status(node_metadata: NodeMetadata) -> Optional[Dict]:
-        """Get status from a Raft-Drone node"""
-        try:
-            client_metadata = NodeMetadata('client', 0)
-            
-            message = Message(
-                msg_type=MessageType.STATUS_REQUEST.value,
-                data={},
-                sender=client_metadata
-            )
-            
-            reader, writer = await asyncio.open_connection(node_metadata.get_host(), node_metadata.get_port())
-            try:
-                # Use NetworkComm's protocol instead of SocketProtocol
-                await RaftDroneClient._send_message_with_length_prefix(writer, message)
-                response = await RaftDroneClient._receive_message_with_length_prefix(reader)
-                
-                if response and response.msg_type == MessageType.STATUS_RESPONSE.value:
-                    return response.data
-            finally:
-                writer.close()
-                await writer.wait_closed()
-        
-        except Exception as e:
-            logger.debug(f"Status request failed: {e}")
-        
-        return None
-    
-    @staticmethod
-    async def find_leader(node_metadatas: List[NodeMetadata]) -> Optional[NodeMetadata]:
-        """Find the current leader in the cluster"""
-        for node_metadata in node_metadatas:
-            status = await RaftDroneClient.get_node_status(node_metadata)
-            if status and status.get('state') == 'leader':
-                return node_metadata
-        return None
-
-
 async def create_single_raft_drone_node(host: str, port: int):
     """Create and start a single Raft-Drone node using NodeMetadata"""
     try:
@@ -1502,8 +1313,8 @@ async def create_single_raft_drone_node(host: str, port: int):
         # Create peer list as NodeMetadata objects
         peers = [NodeMetadata(host, node_port) for node_id, node_port, _ in all_nodes]
         
-        print(f"Creating node {node_id} (drone{drone_index}) at {host}:{port}")
-        print(f"Peers: {[f'{p.get_host()}:{p.get_port()}' for p in peers]}")
+        logger.info(f"Creating node {node_id} (drone{drone_index}) at {host}:{port}")
+        logger.info(f"Peers: {[f'{p.get_host()}:{p.get_port()}' for p in peers]}")
         
         # Create and start the node
         node = RaftDroneNode(node_metadata, drone_index, peers)
@@ -1512,7 +1323,7 @@ async def create_single_raft_drone_node(host: str, port: int):
         return node
         
     except Exception as e:
-        print(f"Error creating node: {e}")
+        logger.error(f"Error creating node: {e}")
         raise
 
 
