@@ -18,15 +18,21 @@ from message import Message, MessageTranslator
 from net import network_utils
 from node_metadata import NodeMetadata
 
-LOG = LoggerFactory.get_logger(__name__)
+logger = LoggerFactory.get_logger(__name__)
 
 
 class NetworkComm:
     """Simplified NetworkComm that supports both queue-based and direct request-response"""
 
-    def __init__(self, nodes: List[NodeMetadata], port: int, send_timeout: float = None):
+    def __init__(
+        self, 
+        nodes: List[NodeMetadata], 
+        port: int, bind_host: str = None, 
+        send_timeout: float = None
+    ):
         self._nodes: List[NodeMetadata] = nodes
         self._port: int = port
+        self._bind_host: str = bind_host or "localhost"
         self._server: Optional[asyncio.Server] = None
         self._send_timeout: float = send_timeout or 5.0
         self._running = False
@@ -42,7 +48,7 @@ class NetworkComm:
 
     async def run(self):
         """Run the network comm layer"""
-        LOG.info("Starting simple network communication layer")
+        logger.info("Starting simple network communication layer")
         self._running = True
         
         # Start the TCP server
@@ -53,7 +59,7 @@ class NetworkComm:
 
     async def stop(self):
         """Stop the network comm layer"""
-        LOG.info("Stopping network communication layer")
+        logger.info("Stopping network communication layer")
         self._running = False
         
         if self._sender_task:
@@ -68,22 +74,23 @@ class NetworkComm:
 
     async def _run_server(self):
         """Start the TCP server"""
-        LOG.info(f"Starting TCP server on port {self._port}")
+        bind_port = getattr(self, "_bind_host", "localhost")
+        logger.info(f"Starting TCP server on port {self._port}")
         try:
             self._server = await asyncio.start_server(
                 self._handle_client,
-                '',  # Listen on all interfaces
+                bind_port,  # Listen on all interfaces
                 self._port
             )
-            LOG.info("Server started successfully")
+            logger.info("Server started successfully")
         except Exception as e:
-            LOG.error(f"Failed to start server: {e}")
+            logger.error(f"Failed to start server: {e}")
             raise
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle incoming client connections"""
         client_addr = writer.get_extra_info('peername')
-        LOG.debug(f"New connection from {client_addr}")
+        logger.debug(f"New connection from {client_addr}")
         
         try:
             if self._connection_handler:
@@ -95,7 +102,7 @@ class NetworkComm:
                 if message:
                     self._recv_queue.put_nowait(message)
         except Exception as e:
-            LOG.debug(f"Connection error with {client_addr}: {e}")
+            logger.debug(f"Connection error with {client_addr}: {e}")
         finally:
             writer.close()
             await writer.wait_closed()
@@ -107,22 +114,22 @@ class NetworkComm:
     async def _shutdown_server(self):
         """Shutdown the TCP server"""
         if self._server:
-            LOG.info("Shutting down server")
+            logger.info("Shutting down server")
             self._server.close()
             await self._server.wait_closed()
 
     async def _process_sender_loop(self):
         """Process messages from send queue (original functionality)"""
-        LOG.info("Starting sender loop")
+        logger.info("Starting sender loop")
         while self._running:
             try:
                 await self._send_messages_in_queue()
                 await asyncio.sleep(0.1)
             except asyncio.CancelledError:
-                LOG.info("Sender loop cancelled")
+                logger.info("Sender loop cancelled")
                 break
             except Exception as e:
-                LOG.error(f"Error in sender loop: {e}")
+                logger.error(f"Error in sender loop: {e}")
                 await asyncio.sleep(1)
 
     async def _send_messages_in_queue(self):
@@ -137,7 +144,7 @@ class NetworkComm:
                         msg
                     )
                     if data:
-                        LOG.debug(f"Sending queued data: {data}")
+                        logger.debug(f"Sending queued data: {data}")
                         await self._send_data_to_all_nodes(data)
             except queue.Empty:
                 break
@@ -168,11 +175,11 @@ class NetworkComm:
             await writer.wait_closed()
             
         except asyncio.TimeoutError:
-            LOG.debug(f"Timeout connecting to {node.get_host()}:{node.get_port()}")
+            logger.debug(f"Timeout connecting to {node.get_host()}:{node.get_port()}")
         except ConnectionRefusedError as e:
-            LOG.debug(f"Failed to connect to {node.get_host()}:{node.get_port()} - {e}")
+            logger.debug(f"Failed to connect to {node.get_host()}:{node.get_port()} - {e}")
         except Exception as e:
-            LOG.debug(f"Failed to send data to {node.get_host()}:{node.get_port()} - {e}")
+            logger.debug(f"Failed to send data to {node.get_host()}:{node.get_port()} - {e}")
 
     # NEW: Direct request-response methods for Raft
     async def send_message_with_response(self, target_node: NodeMetadata, message: Message, timeout: float = 5.0) -> Optional[Message]:
@@ -202,10 +209,10 @@ class NetworkComm:
                 await writer.wait_closed()
                 
         except asyncio.TimeoutError:
-            LOG.debug(f"Timeout sending message to {target_node.get_host()}:{target_node.get_port()}")
+            logger.debug(f"Timeout sending message to {target_node.get_host()}:{target_node.get_port()}")
             return None
         except Exception as e:
-            LOG.debug(f"Failed to send message to {target_node.get_host()}:{target_node.get_port()}: {e}")
+            logger.debug(f"Failed to send message to {target_node.get_host()}:{target_node.get_port()}: {e}")
             return None
 
     async def _send_message(self, writer: asyncio.StreamWriter, message: Message):
@@ -226,7 +233,7 @@ class NetworkComm:
             writer.write(length + json_data)
             await writer.drain()
         except Exception as e:
-            LOG.error(f"Error sending message: {e}")
+            logger.error(f"Error sending message: {e}")
 
     async def _receive_message(self, reader: asyncio.StreamReader) -> Optional[Message]:
         """Receive a message using length-prefixed protocol"""
@@ -252,7 +259,7 @@ class NetworkComm:
                 sender=sender
             )
         except (asyncio.IncompleteReadError, json.JSONDecodeError, struct.error) as e:
-            LOG.debug(f"Error receiving message: {e}")
+            logger.debug(f"Error receiving message: {e}")
             return None
 
     def is_node_me(self, node: NodeMetadata) -> bool:
@@ -265,7 +272,7 @@ class NetworkComm:
         try:
             self._send_queue.put_nowait(message)
         except queue.Full:
-            LOG.warning("Send queue is full, dropping message")
+            logger.warning("Send queue is full, dropping message")
 
     def get_received_message(self) -> Optional[Message]:
         """Get a received message from the queue"""

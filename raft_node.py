@@ -109,6 +109,7 @@ class RaftDroneNode:
         self.network_comm = NetworkComm(
             nodes=peers,
             port=node_metadata.get_port(),
+            bind_host="0.0.0.0", # Bind to all devices
             send_timeout=5.0
         )
         
